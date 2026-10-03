@@ -50,6 +50,36 @@ INVISIBLE_CHARACTERS_RE = re.compile("[" + INVISIBLE_CHARACTERS + "]", re.UNICOD
 INVISIBLE_REPLACEMENT_CHAR = "?"
 
 
+#: Attributes whose value is a single id reference
+IDREF_ATTRIBUTES = frozenset(
+    (
+        "for",
+        "form",
+        "list",
+        "aria-activedescendant",
+        "aria-errormessage",
+    )
+)
+
+#: Attributes whose value is a whitespace-separated list of id references
+IDREFS_ATTRIBUTES = frozenset(
+    (
+        "headers",
+        "itemref",
+        "aria-controls",
+        "aria-describedby",
+        "aria-flowto",
+        "aria-labelledby",
+        "aria-owns",
+    )
+)
+
+#: Regexp matching a local url(#...) reference inside a CSS value; this only
+#: matches the url() functional token so hex colors like "#fff" and "#"
+#: characters elsewhere in the value are left alone
+LOCAL_URL_RE = re.compile(r"url\(\s*(['\"]?)#([^)\s'\"]+)\1\s*\)")
+
+
 class NoCssSanitizerWarning(UserWarning):
     pass
 
@@ -92,6 +122,8 @@ class Cleaner:
         strip_comments=True,
         filters=None,
         css_sanitizer=None,
+        namespace=None,
+        drop_unresolved_refs=False,
     ):
         """Initializes a Cleaner
 
@@ -120,6 +152,20 @@ class Cleaner:
         :arg CSSSanitizer css_sanitizer: instance with a "sanitize_css" method for
             sanitizing style attribute values and style text; defaults to None
 
+        :arg str namespace: optional fragment namespace; when set, ``id``
+            attributes and references to them (``href`` local fragments,
+            ``for``, ``headers``, ``aria-labelledby``, ``aria-describedby``
+            and other IDREF attributes as well as local ``url(#...)``
+            references) are rewritten with a ``"<namespace>-"`` prefix so
+            that multiple cleaned fragments can be combined on a single page
+            without their ids colliding; defaults to None (no rewriting)
+
+        :arg bool drop_unresolved_refs: when ``namespace`` is set, whether to
+            remove references to ids that don't exist in the cleaned fragment
+            (e.g. because the element carrying the id was stripped); dropped
+            references are recorded in ``self.namespace_report``; defaults to
+            False (unresolved references are left as-is)
+
         """
         self.tags = tags
         self.attributes = attributes
@@ -128,6 +174,17 @@ class Cleaner:
         self.strip_comments = strip_comments
         self.filters = filters or []
         self.css_sanitizer = css_sanitizer
+        if namespace is not None and (
+            not isinstance(namespace, str)
+            or not namespace
+            or re.search(r"\s", namespace)
+        ):
+            raise ValueError(
+                "namespace must be None or a non-empty string without whitespace"
+            )
+        self.namespace = namespace
+        self.drop_unresolved_refs = drop_unresolved_refs
+        self.namespace_report = None
 
         self.parser = html5lib_shim.BleachHTMLParser(
             tags=self.tags,
@@ -198,6 +255,18 @@ class Cleaner:
             css_sanitizer=self.css_sanitizer,
             allowed_protocols=self.protocols,
         )
+
+        self.namespace_report = None
+        if self.namespace is not None:
+            # Rewrite ids and id references in the sanitized stream so that
+            # only attributes that survived sanitizing are affected
+            self.namespace_report = {}
+            filtered = NamespaceFilter(
+                source=filtered,
+                namespace=self.namespace,
+                drop_unresolved_refs=self.drop_unresolved_refs,
+                report=self.namespace_report,
+            )
 
         # Apply any filters after the BleachSanitizerFilter
         for filter_class in self.filters:
@@ -637,3 +706,259 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
 
         del token["name"]
         return token
+
+
+class NamespaceFilter(html5lib_shim.Filter):
+    """html5lib filter that namespaces ids and id references in a fragment
+
+    This rewrites ``id`` attributes with a ``"<namespace>-"`` prefix and
+    adjusts all references to those ids so that multiple sanitized fragments
+    can be combined on a single page without their ids colliding or their
+    references crossing fragments.
+
+    It handles:
+
+    * ``id`` attributes
+    * ``href`` and ``xlink:href`` values that are local fragments (``#foo``);
+      fragments in external urls are left alone
+    * single-valued IDREF attributes (``for``, ``form``, ``list``,
+      ``aria-activedescendant``, ``aria-errormessage``)
+    * multi-valued IDREF attributes (``headers``, ``itemref``,
+      ``aria-controls``, ``aria-describedby``, ``aria-flowto``,
+      ``aria-labelledby``, ``aria-owns``) token by token
+    * local ``url(#...)`` references in SVG presentation attributes and
+      ``style`` attribute values
+
+    Duplicate ids are resolved deterministically: the first occurrence in
+    document order keeps the id and all references bind to it; later
+    occurrences have their ``id`` attribute dropped.
+
+    Ids and references that already carry the namespace prefix are left
+    as-is, so cleaning the output again doesn't stack prefixes.
+
+    """
+
+    def __init__(
+        self,
+        source,
+        namespace,
+        drop_unresolved_refs=False,
+        report=None,
+        svg_attr_val_allows_ref=html5lib_shim.svg_attr_val_allows_ref,
+    ):
+        """Creates a NamespaceFilter instance
+
+        :arg source: html5lib TreeWalker stream as an html5lib TreeWalker
+
+        :arg str namespace: the fragment namespace; ids are rewritten to
+            ``"<namespace>-<id>"``
+
+        :arg bool drop_unresolved_refs: whether to drop references to ids
+            that aren't defined in the fragment; when False, unresolved
+            references are left as-is
+
+        :arg dict report: dict to populate with a report of what the filter
+            did; gets the keys ``prefix``, ``id_map``, ``dropped_ids``,
+            ``unresolved_refs`` and ``dropped_refs``
+
+        :arg svg_attr_val_allows_ref: set of attributes that can have
+            ``url(...)`` references
+
+        """
+        html5lib_shim.Filter.__init__(self, source)
+
+        if (
+            not isinstance(namespace, str)
+            or not namespace
+            or re.search(r"\s", namespace)
+        ):
+            raise ValueError("namespace must be a non-empty string without whitespace")
+
+        self.prefix = f"{namespace}-"
+        self.drop_unresolved_refs = drop_unresolved_refs
+        self.report = report if report is not None else {}
+        self.svg_attr_val_allows_ref = svg_attr_val_allows_ref
+
+    def __iter__(self):
+        # Buffer the stream: collecting the id mapping before rewriting
+        # anything is what allows forward references to resolve
+        tokens = list(html5lib_shim.Filter.__iter__(self))
+
+        id_map = {}
+        assigned = set()
+        dropped_ids = []
+        tokens_with_dropped_id = set()
+
+        # First pass: collect ids. First occurrence in document order wins;
+        # later duplicates get their id attribute dropped.
+        for token in tokens:
+            if token["type"] not in ("StartTag", "EmptyTag"):
+                continue
+            data = token.get("data") or {}
+            id_value = data.get((None, "id"))
+            if id_value is None:
+                continue
+            if id_value.startswith(self.prefix):
+                # Already namespaced (e.g. re-cleaning previous output)--don't
+                # stack another prefix
+                final_id = id_value
+            else:
+                final_id = self.prefix + id_value
+            if final_id in assigned:
+                dropped_ids.append(id_value)
+                tokens_with_dropped_id.add(id(token))
+            else:
+                assigned.add(final_id)
+                id_map.setdefault(id_value, final_id)
+
+        unresolved_refs = []
+        dropped_refs = []
+
+        def resolve_ref(attr_label, target):
+            """Returns the resolved id for a reference target or None"""
+            if target in id_map:
+                return id_map[target]
+            if target in assigned:
+                # Reference already carries the prefix and the target exists
+                return target
+            unresolved_refs.append((attr_label, target))
+            if self.drop_unresolved_refs:
+                dropped_refs.append((attr_label, target))
+            return None
+
+        def rewrite_local_urls(attr_label, value):
+            dropped_any = False
+
+            def replace_url(match):
+                nonlocal dropped_any
+                resolved = resolve_ref(attr_label, match.group(2))
+                if resolved is None:
+                    if self.drop_unresolved_refs:
+                        dropped_any = True
+                        return ""
+                    return match.group(0)
+                return f"url(#{resolved})"
+
+            new_value = LOCAL_URL_RE.sub(replace_url, value)
+            if dropped_any:
+                new_value = re.sub(r"\s{2,}", " ", new_value).strip()
+            # If nothing is left, drop the whole attribute
+            return new_value if new_value else None
+
+        def rewrite_style(attr_label, value):
+            # Parse the CSS declarations properly so url() tokens are
+            # rewritten (or their declaration dropped) without treating
+            # strings, hex colors and other "#" occurrences as references
+            if not LOCAL_URL_RE.search(value):
+                return value
+
+            import tinycss2
+            import tinycss2.ast
+
+            declarations = tinycss2.parse_declaration_list(value)
+            new_declarations = []
+            for declaration in declarations:
+                if declaration.type != "declaration":
+                    new_declarations.append(declaration)
+                    continue
+                new_value = []
+                drop_declaration = False
+                for sub_token in declaration.value:
+                    if sub_token.type == "url" and sub_token.value.startswith("#"):
+                        resolved = resolve_ref(attr_label, sub_token.value[1:])
+                        if resolved is None:
+                            if self.drop_unresolved_refs:
+                                # A dangling url() leaves a broken declaration,
+                                # so drop the whole declaration
+                                drop_declaration = True
+                                break
+                        else:
+                            sub_token = tinycss2.ast.URLToken(
+                                sub_token.source_line,
+                                sub_token.source_column,
+                                f"#{resolved}",
+                                f"url(#{resolved})",
+                            )
+                    new_value.append(sub_token)
+                if drop_declaration:
+                    continue
+                declaration.value = new_value
+                new_declarations.append(declaration)
+            return tinycss2.serialize(new_declarations).strip()
+
+        xlink_href = (html5lib_shim.namespaces["xlink"], "href")
+
+        # Second pass: rewrite ids and references
+        for token in tokens:
+            if token["type"] not in ("StartTag", "EmptyTag"):
+                continue
+            data = token.get("data")
+            if not data:
+                continue
+
+            new_data = {}
+            for namespaced_name, val in data.items():
+                attr_namespace, name = namespaced_name
+
+                if namespaced_name == (None, "id"):
+                    if id(token) in tokens_with_dropped_id:
+                        continue
+                    val = id_map[val]
+
+                elif namespaced_name in ((None, "href"), xlink_href):
+                    # Only rewrite local fragments; fragments in external
+                    # urls are not local references
+                    if val.startswith("#"):
+                        resolved = resolve_ref("href", val[1:])
+                        if resolved is None:
+                            if self.drop_unresolved_refs:
+                                continue
+                        else:
+                            val = f"#{resolved}"
+
+                elif attr_namespace is None and name in IDREF_ATTRIBUTES:
+                    resolved = resolve_ref(name, val)
+                    if resolved is None:
+                        if self.drop_unresolved_refs:
+                            continue
+                    else:
+                        val = resolved
+
+                elif attr_namespace is None and name in IDREFS_ATTRIBUTES:
+                    new_targets = []
+                    for target in val.split():
+                        resolved = resolve_ref(name, target)
+                        if resolved is None:
+                            if not self.drop_unresolved_refs:
+                                new_targets.append(target)
+                        else:
+                            new_targets.append(resolved)
+                    if not new_targets:
+                        continue
+                    val = " ".join(new_targets)
+
+                elif namespaced_name in self.svg_attr_val_allows_ref:
+                    val = rewrite_local_urls(name, val)
+                    if val is None:
+                        continue
+
+                elif namespaced_name == (None, "style"):
+                    val = rewrite_style(name, val)
+                    if not val:
+                        continue
+
+                new_data[namespaced_name] = val
+
+            token["data"] = new_data
+
+        self.report.update(
+            {
+                "prefix": self.prefix,
+                "id_map": id_map,
+                "dropped_ids": dropped_ids,
+                "unresolved_refs": unresolved_refs,
+                "dropped_refs": dropped_refs,
+            }
+        )
+
+        return iter(tokens)

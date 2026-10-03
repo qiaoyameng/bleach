@@ -27,6 +27,8 @@ def clean(
     strip=False,
     strip_comments=True,
     css_sanitizer=None,
+    namespace=None,
+    drop_unresolved_refs=False,
 ):
     """Clean an HTML fragment of malicious content and return it
 
@@ -68,6 +70,15 @@ def clean(
     :arg CSSSanitizer css_sanitizer: instance with a "sanitize_css" method for
         sanitizing style attribute values and style text; defaults to None
 
+    :arg str namespace: optional fragment namespace; when set, ``id``
+        attributes and references to them are rewritten with a
+        ``"<namespace>-"`` prefix so multiple cleaned fragments can be
+        combined on a single page without id collisions; defaults to None
+
+    :arg bool drop_unresolved_refs: when ``namespace`` is set, whether to
+        remove references to ids that don't exist in the cleaned fragment;
+        defaults to False
+
     :returns: cleaned text as unicode
 
     """
@@ -78,6 +89,8 @@ def clean(
         strip=strip,
         strip_comments=strip_comments,
         css_sanitizer=css_sanitizer,
+        namespace=namespace,
+        drop_unresolved_refs=drop_unresolved_refs,
     )
     return cleaner.clean(text)
 

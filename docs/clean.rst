@@ -343,6 +343,55 @@ Defaults are stored in ``bleach.css_sanitizer.ALLOWED_CSS_PROPERTIES`` and
 
 .. autoclass:: bleach.css_sanitizer.CSSSanitizer
 
+
+.. _clean-chapter-namespacing-fragments:
+
+Namespacing fragments
+=====================
+
+When several cleaned fragments from different users end up on the same page,
+their ``id`` attributes (e.g. ``id="title"``) can collide and their local
+references can bind to elements in other fragments. Passing ``namespace``
+rewrites ids and all references to them with a ``"<namespace>-"`` prefix
+during cleaning:
+
+.. doctest::
+
+   >>> import bleach
+
+   >>> tags = {'h1', 'a'}
+   >>> attrs = {'*': ['id'], 'a': ['href']}
+
+   >>> bleach.clean(
+   ...     '<h1 id="title">hi</h1><a href="#title">top</a>',
+   ...     tags=tags,
+   ...     attributes=attrs,
+   ...     namespace="user1"
+   ... )
+   '<h1 id="user1-title">hi</h1><a href="#user1-title">top</a>'
+
+The rewriter:
+
+* only touches attributes that survived sanitizing
+* rewrites local fragment ``href`` values (``#foo``); fragments in external
+  urls are left alone
+* handles single-valued IDREF attributes (``for``, ``form``, ``list``,
+  ``aria-activedescendant``, ``aria-errormessage``) and multi-valued ones
+  (``headers``, ``itemref``, ``aria-controls``, ``aria-describedby``,
+  ``aria-flowto``, ``aria-labelledby``, ``aria-owns``) token by token
+* rewrites local ``url(#...)`` references in SVG presentation attributes and
+  ``style`` values
+* resolves forward references and handles duplicate ids deterministically:
+  the first occurrence in document order wins and later duplicates are
+  dropped
+* is idempotent: cleaning the output again doesn't stack prefixes
+
+References to ids that don't exist in the cleaned fragment (for example
+because the element carrying the id was stripped) are left as-is by default.
+Pass ``drop_unresolved_refs=True`` to remove them instead. Use a
+:py:class:`bleach.sanitizer.Cleaner` instance to inspect what happened via
+``cleaner.namespace_report`` after calling ``clean()``.
+
 .. versionadded:: 5.0
 
 

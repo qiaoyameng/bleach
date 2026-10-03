@@ -1,6 +1,22 @@
 Bleach changes
 ==============
 
+Version 6.5.0 (unreleased)
+--------------------------
+
+**Features**
+
+* Add optional fragment namespacing to ``clean`` and ``Cleaner``: passing
+  ``namespace="frag"`` rewrites ``id`` attributes and references to them
+  (local fragment ``href`` values, ``for``, ``headers``,
+  ``aria-labelledby``/``aria-describedby`` and other IDREF attributes, and
+  local ``url(#...)`` references in SVG presentation attributes and ``style``
+  values) with a ``"frag-"`` prefix so multiple cleaned fragments can be
+  combined on one page without id collisions. Duplicate ids are resolved
+  deterministically (first occurrence wins), references to ids missing from
+  the fragment can optionally be dropped with ``drop_unresolved_refs=True``,
+  and ``Cleaner.namespace_report`` describes what was rewritten.
+
 Version 6.4.0 (June 5th, 2026)
 ------------------------------
 
