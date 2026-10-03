@@ -1,6 +1,24 @@
 Bleach changes
 ==============
 
+In development
+--------------
+
+**New features**
+
+* Added optional fragment id namespacing. ``bleach.clean`` and
+  ``bleach.sanitizer.Cleaner`` now accept ``id_namespace`` to rewrite every
+  ``id`` in a cleaned fragment as ``<id_namespace>-<id>`` together with its
+  same-fragment ID references (``href="#..."``, ``for``, ``form``,
+  ``headers``, ``usemap``, ``ping`` and the ``aria-labelledby``/
+  ``aria-describedby`` IDREF family). External URL fragments are not treated
+  as local references, multi-value attributes are handled per token, forward
+  references are resolved, duplicate ids get a deterministic document-order
+  suffix, and re-cleaning doesn't stack a second prefix. ``svg_references``
+  additionally rewrites local ``url(#...)`` and SVG ``href`` references;
+  ``dangling_idref_callback`` reports and optionally removes references whose
+  target was removed during cleaning.
+
 Version 6.4.0 (June 5th, 2026)
 ------------------------------
 

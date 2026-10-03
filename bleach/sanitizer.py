@@ -5,6 +5,7 @@ import warnings
 from xml.sax.saxutils import unescape
 
 from bleach import html5lib_shim
+from bleach import namespace
 from bleach import parse_shim
 
 
@@ -92,6 +93,9 @@ class Cleaner:
         strip_comments=True,
         filters=None,
         css_sanitizer=None,
+        id_namespace=None,
+        svg_references=False,
+        dangling_idref_callback=None,
     ):
         """Initializes a Cleaner
 
@@ -120,7 +124,42 @@ class Cleaner:
         :arg CSSSanitizer css_sanitizer: instance with a "sanitize_css" method for
             sanitizing style attribute values and style text; defaults to None
 
+        :arg str id_namespace: when set, every ``id`` in the cleaned fragment is
+            rewritten to ``<id_namespace>-<id>`` and same-fragment ID
+            references (``href="#..."``, ``for``, ``headers``,
+            ``aria-labelledby``/``aria-describedby`` and friends) are rewritten
+            to match; defaults to None which leaves ids and references alone
+
+        :arg bool svg_references: when namespacing, also rewrite local
+            ``url(#...)`` references in SVG presentation attributes (for
+            example ``fill``) and local ``href``/``xlink:href`` fragments on
+            SVG elements; defaults to False
+
+        :arg dangling_idref_callback: optional callable invoked as
+            ``callback(tag, attribute, reference)`` once for every ID
+            reference whose target id doesn't exist in the fragment (for
+            example because the element carrying it was removed by cleaning).
+            When set, dangling references are removed from the output; when
+            None (the default), unresolved references are left untouched
+
         """
+        if id_namespace is not None and (
+            not isinstance(id_namespace, str)
+            or not id_namespace
+            or re.search(r"\s", id_namespace)
+        ):
+            raise ValueError(
+                "id_namespace must be a non-empty string without whitespace"
+            )
+
+        if id_namespace is None and (
+            svg_references or dangling_idref_callback is not None
+        ):
+            raise ValueError(
+                "svg_references and dangling_idref_callback require "
+                "id_namespace to be set"
+            )
+
         self.tags = tags
         self.attributes = attributes
         self.protocols = protocols
@@ -128,6 +167,9 @@ class Cleaner:
         self.strip_comments = strip_comments
         self.filters = filters or []
         self.css_sanitizer = css_sanitizer
+        self.id_namespace = id_namespace
+        self.svg_references = svg_references
+        self.dangling_idref_callback = dangling_idref_callback
 
         self.parser = html5lib_shim.BleachHTMLParser(
             tags=self.tags,
@@ -199,8 +241,21 @@ class Cleaner:
             allowed_protocols=self.protocols,
         )
 
-        # Apply any filters after the BleachSanitizerFilter
-        for filter_class in self.filters:
+        # Rewrite ids and their references before any user-supplied filters.
+        # Runs after sanitizing, so it only touches attributes that survived.
+        extra_filters = []
+        if self.id_namespace is not None:
+            extra_filters.append(
+                lambda source: namespace.FragmentNamespaceFilter(
+                    source,
+                    prefix=self.id_namespace,
+                    svg_references=self.svg_references,
+                    dangling_callback=self.dangling_idref_callback,
+                )
+            )
+
+        # Apply any additional filters after the BleachSanitizerFilter
+        for filter_class in extra_filters + self.filters:
             filtered = filter_class(source=filtered)
 
         return self.serializer.render(filtered)

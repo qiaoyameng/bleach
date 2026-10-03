@@ -27,6 +27,9 @@ def clean(
     strip=False,
     strip_comments=True,
     css_sanitizer=None,
+    id_namespace=None,
+    svg_references=False,
+    dangling_idref_callback=None,
 ):
     """Clean an HTML fragment of malicious content and return it
 
@@ -68,6 +71,25 @@ def clean(
     :arg CSSSanitizer css_sanitizer: instance with a "sanitize_css" method for
         sanitizing style attribute values and style text; defaults to None
 
+    :arg str id_namespace: when set, prefixes every ``id`` in the fragment
+        with ``<id_namespace>-`` and rewrites same-fragment ID references
+        (``href="#..."``, ``for``, ``headers``, ``aria-labelledby`` and
+        related ``aria-*`` IDREF attributes) to match. Useful when combining
+        multiple user-supplied fragments on one page so their ids and
+        references can't collide or cross-link; defaults to None
+
+    :arg bool svg_references: when ``id_namespace`` is set, also rewrite
+        local ``url(#...)`` references in SVG presentation attributes and
+        local ``href``/``xlink:href`` fragments on SVG elements; defaults to
+        False
+
+    :arg dangling_idref_callback: optional callable invoked as
+        ``callback(tag, attribute, reference)`` for ID references whose
+        target id isn't present in the cleaned fragment (for example because
+        the target element was removed). When given, dangling references are
+        removed; when None (the default), unresolved references are kept;
+        defaults to None
+
     :returns: cleaned text as unicode
 
     """
@@ -78,6 +100,9 @@ def clean(
         strip=strip,
         strip_comments=strip_comments,
         css_sanitizer=css_sanitizer,
+        id_namespace=id_namespace,
+        svg_references=svg_references,
+        dangling_idref_callback=dangling_idref_callback,
     )
     return cleaner.clean(text)
 

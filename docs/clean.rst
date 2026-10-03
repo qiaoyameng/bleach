@@ -405,6 +405,79 @@ Trivial Filter example:
 .. versionadded:: 2.0
 
 
+Combining fragments (``id_namespace``)
+======================================
+
+When several user-supplied fragments end up on the same page, two fragments
+can both use ``id="title"``, and links such as ``<a href="#title">`` can end
+up pointing at the wrong fragment's element. Pass ``id_namespace`` to prefix
+every ``id`` in a fragment with ``<id_namespace>-`` and rewrite the
+fragment's own ID references to match::
+
+    >>> import bleach
+    >>> TAGS = {'h1', 'a'}
+    >>> ATTRS = {'h1': ['id'], 'a': ['href']}
+    >>> bleach.clean('<h1 id="title">Hi</h1><a href="#title">top</a>',
+    ...              tags=TAGS, attributes=ATTRS, id_namespace='frag1')
+    '<h1 id="frag1-title">Hi</h1><a href="#frag1-title">top</a>'
+
+Clean each fragment with its own namespace and the references in the merged
+page can never cross-link. Forward references (a link appearing before its
+target) are rewritten as well.
+
+The rewriting only touches attributes that survived cleaning:
+
+* ``id`` itself
+* same-document references in ``href`` (``#fragment`` only--an external URL
+  such as ``https://example.com/page#fragment`` is left alone), ``usemap``
+  and the space-separated tokens of ``ping``
+* single ID references: ``for``, ``form`` and the single-value
+  ``aria-*`` IDREF attributes (``aria-activedescendant``, ``aria-details``,
+  ``aria-errormessage``)
+* space-separated ID reference lists: ``headers``, ``aria-labelledby``,
+  ``aria-describedby``, ``aria-controls``, ``aria-owns`` and ``aria-flowto``
+
+Duplicate ids inside one fragment are resolved deterministically in document
+order: the first occurrence keeps ``<namespace>-<id>`` and later occurrences
+become ``<namespace>-<id>-2``, ``<namespace>-<id>-3`` and so on. References
+always bind to the first occurrence--the same element a browser resolves
+them to.
+
+Re-cleaning an already namespaced fragment with the same ``id_namespace``
+does not stack a second prefix on it.
+
+Unresolved references
+---------------------
+
+By default an ID reference whose target doesn't exist in the cleaned
+fragment (for example because the element carrying the target was removed
+by cleaning) is left untouched. Pass ``dangling_idref_callback`` with a
+callable to remove such references instead; the callable is invoked once
+per unresolved reference as ``callback(tag, attribute, reference)``::
+
+    >>> def report(tag, attribute, reference):
+    ...     print(tag, attribute, reference)
+    ...
+    >>> bleach.clean('<label for="missing">Label</label>',
+    ...              tags={'label'}, attributes={'label': ['for']},
+    ...              id_namespace='frag1',
+    ...              dangling_idref_callback=report)
+    label for missing
+    '<label>Label</label>'
+
+SVG references
+--------------
+
+Local SVG references such as ``fill="url(#grad)"`` and
+``<use href="#icon">`` are only rewritten when you also pass
+``svg_references=True``--they require the corresponding SVG tags and
+attributes to be allowed. External ``url(...)`` values are never treated as
+local references, and CSS text (such as a ``<style>`` element) is never
+parsed or rewritten.
+
+.. versionadded:: 6.4.0
+
+
 Using ``bleach.sanitizer.BleachSanitizerFilter``
 ================================================
 
