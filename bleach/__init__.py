@@ -27,6 +27,7 @@ def clean(
     strip=False,
     strip_comments=True,
     css_sanitizer=None,
+    drop_subtrees=None,
 ):
     """Clean an HTML fragment of malicious content and return it
 
@@ -68,6 +69,9 @@ def clean(
     :arg CSSSanitizer css_sanitizer: instance with a "sanitize_css" method for
         sanitizing style attribute values and style text; defaults to None
 
+    :arg drop_subtrees: tags to drop along with their entire subtrees; can
+        be a callable or an iterable of tag names; defaults to None
+
     :returns: cleaned text as unicode
 
     """
@@ -78,6 +82,7 @@ def clean(
         strip=strip,
         strip_comments=strip_comments,
         css_sanitizer=css_sanitizer,
+        drop_subtrees=drop_subtrees,
     )
     return cleaner.clean(text)
 

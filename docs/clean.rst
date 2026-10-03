@@ -290,6 +290,59 @@ By default, Bleach will strip out HTML comments. To disable this behavior, set
    'my<!-- commented --> html'
 
 
+.. _clean-chapter-dropping-subtrees:
+
+Dropping subtrees (``drop_subtrees``)
+=====================================
+
+``strip=True`` removes disallowed tags, but keeps their text content. If you
+want to remove an element and everything in it--for example ``script`` and
+``style`` elements or containers marked with a ``data-private`` attribute--use
+``drop_subtrees``:
+
+.. doctest::
+
+   >>> import bleach
+
+   >>> bleach.clean('a<script>alert("boo!");</script>b', strip=True)
+   'aalert("boo!");b'
+
+   >>> bleach.clean('a<script>alert("boo!");</script>b', drop_subtrees={'script', 'style'})
+   'ab'
+
+``drop_subtrees`` can be an iterable of tag names or a callable. The callable
+is called with the tag name, the namespace (or ``None``) and a dict of
+attributes for every element in the parsed document and returns ``True`` to
+drop the element and its entire subtree:
+
+.. doctest::
+
+   >>> import bleach
+
+   >>> def drop_private(tag, namespace, attrs):
+   ...     return 'data-private' in attrs
+
+   >>> bleach.clean(
+   ...     'shown<div data-private>hidden</div>',
+   ...     tags={'div'},
+   ...     drop_subtrees=drop_private,
+   ... )
+   'shown'
+
+Dropping happens on the parsed document before sanitizing, so misnested
+markup, raw text elements and table foster parenting are handled the way the
+HTML5 parser resolved them and dropped content--including attributes and
+text--is never passed to filters. The callable can only drop content; it can't
+allow anything that the allow rules wouldn't allow.
+
+.. Note::
+
+   The parsed document only contains elements allowed by ``tags``, so a
+   callable can only make drop decisions for those elements. Tags dropped by
+   name with the iterable form are parsed as elements so their subtrees can be
+   dropped, but they're never allowed.
+
+
 .. _clean-chapter-sanitizing-css:
 
 Sanitizing CSS

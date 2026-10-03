@@ -1266,3 +1266,168 @@ class TestCleaner:
 
         dirty = 'this is cute! <img src="http://example.com/puppy.jpg" rel="nofollow">'
         assert cleaner.clean(dirty) == 'this is cute! <img src="moo" rel="moo">'
+
+
+def drop_private(tag, namespace, attrs):
+    """Drops any element with a data-private attribute"""
+    return "data-private" in attrs
+
+
+class TestCleanerDropSubtrees:
+    @pytest.mark.parametrize(
+        "data,expected",
+        [
+            # Raw text element content is dropped, too
+            (
+                'a<script>alert("1 < 2 && 3 > 2");</script>b',
+                "ab",
+            ),
+            ("a<style>body { color: red }</style>b", "ab"),
+            # An unclosed raw text element swallows the rest of the text
+            ("a<script>alert(1)", "a"),
+            # Raw text elements nested in the source aren't nested in the
+            # parsed tree
+            ("a<script><script>nested</script></script>b", "ab"),
+        ],
+    )
+    def test_drop_raw_text_elements(self, data, expected):
+        cleaner = Cleaner(drop_subtrees={"script", "style"})
+        assert cleaner.clean(data) == expected
+
+    @pytest.mark.parametrize(
+        "data,expected",
+        [
+            # Plain text next to a dropped container isn't swallowed
+            ("before<div data-private>secret</div>after", "beforeafter"),
+            # Nested dropped regions
+            (
+                "a<div data-private>1<div data-private>2</div>3</div>b",
+                "ab",
+            ),
+            # Empty elements inside a dropped region go with it
+            (
+                'a<div data-private>x<br><img src="p.jpg">y</div>b',
+                "ab",
+            ),
+            # An empty element can be a drop target itself
+            ("a<br data-private>b", "ab"),
+            # An unclosed dropped container swallows the rest of the text
+            ("a<div data-private>secret", "a"),
+            # Misnested markup is resolved by the parser before dropping
+            ("a<div data-private><b>secret</div>b", "a<b>b</b>"),
+            # Comments inside a dropped region are dropped even when comments
+            # are kept
+            ("a<div data-private><!-- secret --></div>b", "ab"),
+            # Entities inside a dropped region are dropped; entities outside
+            # are untouched
+            ("a<div data-private>&amp;&nbsp;</div>b&amp;c", "ab&amp;c"),
+        ],
+    )
+    def test_drop_by_attribute(self, data, expected):
+        cleaner = Cleaner(
+            tags={"div", "b", "br"},
+            strip_comments=False,
+            drop_subtrees=drop_private,
+        )
+        assert cleaner.clean(data) == expected
+
+    def test_drop_self_closing_syntax_on_non_void_element(self):
+        # The HTML5 parser ignores the self-closing flag on non-void
+        # elements, so "b" is inside the dropped div
+        cleaner = Cleaner(tags={"div"}, drop_subtrees=drop_private)
+        assert cleaner.clean("a<div data-private/>b") == "a"
+
+    def test_drop_foster_parenting(self):
+        # Text foster-parented out of the table is kept; the dropped
+        # container in the table cell takes its text with it
+        cleaner = Cleaner(
+            tags={"table", "tbody", "tr", "td", "div"},
+            drop_subtrees=drop_private,
+        )
+        assert (
+            cleaner.clean(
+                "k1<table>k2<tr><td><div data-private>secret</div>k4</td></tr>"
+                "</table>k5"
+            )
+            == "k1k2<table><tbody><tr><td>k4</td></tr></tbody></table>k5"
+        )
+
+    def test_drop_svg_html_mixed(self):
+        # Dropping by name drops the element in any namespace
+        cleaner = Cleaner(drop_subtrees={"script"})
+        assert (
+            cleaner.clean("a<svg><script>alert(1)</script><circle/></svg>b")
+            == "a&lt;svg&gt;&lt;circle/&gt;&lt;/svg&gt;b"
+        )
+
+    def test_drop_callback_gets_namespace(self):
+        # The callback can use the namespace to only drop script elements in
+        # the svg namespace
+        def drop_svg_script(tag, namespace, attrs):
+            return tag == "script" and namespace == "http://www.w3.org/2000/svg"
+
+        cleaner = Cleaner(tags={"svg", "script"}, drop_subtrees=drop_svg_script)
+        assert (
+            cleaner.clean("a<svg><script>x</script><circle/></svg>b<script>y</script>")
+            == "a<svg>&lt;circle/&gt;</svg>b<script>y</script>"
+        )
+
+    def test_drop_only_dropped_content(self):
+        cleaner = Cleaner(drop_subtrees={"script"})
+        assert cleaner.clean("<script>x</script>") == ""
+
+    def test_drop_coexists_with_strip(self):
+        cleaner = Cleaner(strip=True, drop_subtrees={"script"})
+        assert cleaner.clean("a<span>hi</span><script>x</script>b") == "ahib"
+
+    def test_drop_callback_cannot_allow(self):
+        # A callback that drops nothing changes nothing
+        cleaner = Cleaner(drop_subtrees=lambda tag, namespace, attrs: False)
+        for text in (
+            "a<span>x</span>b",
+            "<b>bold</b><script>alert(1)</script>",
+        ):
+            assert cleaner.clean(text) == Cleaner().clean(text)
+
+        # A callback that drops everything still can't allow disallowed
+        # tags--they're escaped as usual
+        cleaner = Cleaner(drop_subtrees=lambda tag, namespace, attrs: True)
+        assert cleaner.clean("a<b>c</b><span>d</span>") == "a&lt;span&gt;d&lt;/span&gt;"
+
+    def test_dropped_content_doesnt_reach_filters(self):
+        seen = []
+
+        class RecordingFilter(Filter):
+            def __iter__(self):
+                for token in Filter.__iter__(self):
+                    seen.append(token)
+                    yield token
+
+        cleaner = Cleaner(
+            tags={"div"},
+            filters=[RecordingFilter],
+            drop_subtrees=drop_private,
+        )
+        assert (
+            cleaner.clean('a<div data-private data-x="secret-attr">secret</div>b')
+            == "ab"
+        )
+        assert all("secret" not in str(token) for token in seen)
+
+    def test_dropped_content_isnt_linkified(self):
+        from bleach.linkifier import LinkifyFilter
+
+        cleaner = Cleaner(
+            tags={"div", "a"},
+            attributes={"a": ["href"]},
+            filters=[LinkifyFilter],
+            drop_subtrees=drop_private,
+        )
+        assert (
+            cleaner.clean(
+                "<div data-private>http://secret.example.com</div>"
+                "http://public.example.com"
+            )
+            == '<a href="http://public.example.com" rel="nofollow">'
+            "http://public.example.com</a>"
+        )

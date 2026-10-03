@@ -92,6 +92,7 @@ class Cleaner:
         strip_comments=True,
         filters=None,
         css_sanitizer=None,
+        drop_subtrees=None,
     ):
         """Initializes a Cleaner
 
@@ -120,6 +121,32 @@ class Cleaner:
         :arg CSSSanitizer css_sanitizer: instance with a "sanitize_css" method for
             sanitizing style attribute values and style text; defaults to None
 
+        :arg drop_subtrees: tags to drop along with their entire subtrees; can
+            be a callable or an iterable of tag names; defaults to None
+
+            A callable gets called with the tag name, the namespace (or None),
+            and a dict of attributes for every element in the parsed document
+            and returns True to drop the element and everything in it or False
+            to leave it to the regular allow/strip rules. For example::
+
+                def drop_private(tag, namespace, attrs):
+                    return "data-private" in attrs
+
+            Note that the parsed document only contains elements allowed by
+            ``tags``, so a callable can only make drop decisions in that
+            allowed context--it can't drop (or allow) anything else.
+
+            An iterable of tag names drops elements with those local tag names
+            in any namespace; for example ``{"script", "style"}``. These tags
+            are parsed as elements so their subtrees can be dropped, but
+            they're never allowed--unlike ``strip=True``, their text content
+            is dropped, too.
+
+            Dropping happens on the parsed document before sanitizing, so
+            dropped content--including attributes and text--is never passed to
+            filters. The callback can only drop content; it can't allow
+            anything that the allow rules wouldn't allow.
+
         """
         self.tags = tags
         self.attributes = attributes
@@ -128,9 +155,19 @@ class Cleaner:
         self.strip_comments = strip_comments
         self.filters = filters or []
         self.css_sanitizer = css_sanitizer
+        self.drop_subtrees = drop_subtrees
+
+        if drop_subtrees is not None and not callable(drop_subtrees):
+            # Tags being dropped by name have to be parsed as elements so the
+            # sanitizer filter can drop their subtrees. They're not added to
+            # the allowed tags--the filter drops them before allow rules are
+            # applied.
+            parser_tags = set(self.tags) | {name.lower() for name in drop_subtrees}
+        else:
+            parser_tags = self.tags
 
         self.parser = html5lib_shim.BleachHTMLParser(
-            tags=self.tags,
+            tags=parser_tags,
             strip=self.strip,
             consume_entities=False,
             namespaceHTMLElements=False,
@@ -197,6 +234,7 @@ class Cleaner:
             strip_html_comments=self.strip_comments,
             css_sanitizer=self.css_sanitizer,
             allowed_protocols=self.protocols,
+            drop_subtrees=self.drop_subtrees,
         )
 
         # Apply any filters after the BleachSanitizerFilter
@@ -249,6 +287,33 @@ def attribute_filter_factory(attributes):
     raise ValueError("attributes needs to be a callable, a list or a dict")
 
 
+def normalized_attributes(token):
+    """Converts a tag token's attribute data to a name -> value dict
+
+    Attribute names that have a namespace are rendered as "prefix:name".
+
+    :arg dict token: the StartTag or EmptyTag token to convert
+
+    :returns: dict of attribute name to value
+
+    """
+    attrs = {}
+    for (ns, name), v in token["data"].items():
+        # If we end up with a namespace, but no name, switch them so we
+        # have a valid name to use.
+        if ns and not name:
+            ns, name = name, ns
+
+        # Figure out namespaced name if the namespace is appropriate
+        # and exists; if the ns isn't in prefixes, then drop it.
+        if ns is None or ns not in html5lib_shim.prefixes:
+            attrs[name] = v
+        else:
+            attrs[f"{html5lib_shim.prefixes[ns]}:{name}"] = v
+
+    return attrs
+
+
 class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
     """html5lib Filter that sanitizes text
 
@@ -268,6 +333,7 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
         strip_disallowed_tags=False,
         strip_html_comments=True,
         css_sanitizer=None,
+        drop_subtrees=None,
     ):
         """Creates a BleachSanitizerFilter instance
 
@@ -298,6 +364,19 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
         :arg CSSSanitizer css_sanitizer: instance with a "sanitize_css" method for
             sanitizing style attribute values and style text; defaults to None
 
+        :arg drop_subtrees: tags to drop along with their entire subtrees; can
+            be a callable or an iterable of tag names; defaults to None
+
+            A callable gets called with the tag name, the namespace (or None),
+            and a dict of attributes for every element in the parsed document
+            and returns True to drop the element and everything in it or False
+            to leave it to the regular allow/strip rules. The callable can
+            only drop content--it can't allow anything the allow rules
+            wouldn't allow.
+
+            An iterable of tag names drops elements with those local tag names
+            in any namespace.
+
         """
         # NOTE(willkg): This is the superclass of
         # html5lib.filters.sanitizer.Filter. We call this directly skipping the
@@ -318,8 +397,51 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
         self.css_sanitizer = css_sanitizer
         self.svg_allow_local_href = svg_allow_local_href
 
+        if drop_subtrees is None or callable(drop_subtrees):
+            self.drop_subtrees = drop_subtrees
+        else:
+            drop_names = frozenset(drop_subtrees)
+
+            def drop_by_name(tag, namespace, attrs):
+                return tag in drop_names
+
+            self.drop_subtrees = drop_by_name
+
     def sanitize_stream(self, token_iterator):
+        # Depth of the subtree currently being dropped; 0 means we're not
+        # inside a dropped subtree. Tokens come from walking the parsed DOM
+        # tree, so StartTag/EndTag tokens are balanced and nested dropped
+        # subtrees, raw text elements, misnesting and foster parenting have
+        # already been resolved by the parser.
+        drop_depth = 0
+
         for token in token_iterator:
+            if drop_depth:
+                # This token is inside a dropped subtree--swallow it so its
+                # text and attributes never reach downstream filters or the
+                # serializer.
+                token_type = token["type"]
+                if token_type == "StartTag":
+                    drop_depth += 1
+                elif token_type == "EndTag":
+                    drop_depth -= 1
+                continue
+
+            if (
+                self.drop_subtrees is not None
+                and token["type"] in ("StartTag", "EmptyTag")
+                and self.drop_subtrees(
+                    token["name"],
+                    token.get("namespace"),
+                    normalized_attributes(token),
+                )
+            ):
+                # Drop this element and its entire subtree. EmptyTag tokens
+                # have no subtree, so only StartTag tokens affect the depth.
+                if token["type"] == "StartTag":
+                    drop_depth = 1
+                continue
+
             ret = self.sanitize_token(token)
 
             if not ret:
