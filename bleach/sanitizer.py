@@ -92,6 +92,8 @@ class Cleaner:
         strip_comments=True,
         filters=None,
         css_sanitizer=None,
+        drop_tags=None,
+        drop_callbacks=None,
     ):
         """Initializes a Cleaner
 
@@ -120,6 +122,24 @@ class Cleaner:
         :arg CSSSanitizer css_sanitizer: instance with a "sanitize_css" method for
             sanitizing style attribute values and style text; defaults to None
 
+        :arg drop_tags: tags whose entire subtree (the tag, its attributes and
+            all of its contents) is dropped from the output; items can be tag
+            names (strings) for HTML elements or ``(namespace, tag)`` tuples
+            where namespace is a namespace URI or a prefix like ``"svg"``;
+            defaults to None
+
+            .. Note::
+
+               Dropped content is removed before any filters run, so it never
+               reaches ``LinkifyFilter`` or other filters.
+
+        :arg drop_callbacks: list of callables that decide whether a tag's
+            entire subtree is dropped; each callable is called with the tag
+            token for tags that survive tokenizing (allowed tags and
+            ``drop_tags``) and returns True to drop the subtree; callbacks can
+            only remove content--they can't allow tags that aren't in ``tags``
+            or ``drop_tags``; defaults to None
+
         """
         self.tags = tags
         self.attributes = attributes
@@ -128,9 +148,20 @@ class Cleaner:
         self.strip_comments = strip_comments
         self.filters = filters or []
         self.css_sanitizer = css_sanitizer
+        self.drop_tags = drop_tags or []
+        self.drop_callbacks = drop_callbacks or []
+
+        # Dropped tags have to survive tokenizing as real elements so the
+        # parser can build their subtrees (handling raw text, misnesting,
+        # foster parenting, etc.) and the sanitizer filter can drop them from
+        # the parsed tree.
+        parser_tags = set(self.tags)
+        for item in self.drop_tags:
+            name = item if isinstance(item, str) else item[1]
+            parser_tags.add(name.lower())
 
         self.parser = html5lib_shim.BleachHTMLParser(
-            tags=self.tags,
+            tags=parser_tags,
             strip=self.strip,
             consume_entities=False,
             namespaceHTMLElements=False,
@@ -197,6 +228,8 @@ class Cleaner:
             strip_html_comments=self.strip_comments,
             css_sanitizer=self.css_sanitizer,
             allowed_protocols=self.protocols,
+            drop_tags=self.drop_tags,
+            drop_callbacks=self.drop_callbacks,
         )
 
         # Apply any filters after the BleachSanitizerFilter
@@ -249,6 +282,30 @@ def attribute_filter_factory(attributes):
     raise ValueError("attributes needs to be a callable, a list or a dict")
 
 
+def drop_tag_set(drop_tags):
+    """Normalizes drop_tags into a set of (namespace, name) tuples
+
+    Tag names given as strings match HTML elements, so they're normalized to
+    both no-namespace and the HTML namespace since that depends on parser
+    configuration. ``(namespace, name)`` tuples can use a namespace URI or a
+    prefix like ``"svg"``.
+
+    """
+    normalized = set()
+    for item in drop_tags or []:
+        if isinstance(item, str):
+            namespace, name = None, item
+        else:
+            namespace, name = item
+            namespace = html5lib_shim.namespaces.get(namespace, namespace)
+
+        normalized.add((namespace, name.lower()))
+        if namespace is None:
+            normalized.add((html5lib_shim.namespaces["html"], name.lower()))
+
+    return frozenset(normalized)
+
+
 class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
     """html5lib Filter that sanitizes text
 
@@ -268,6 +325,8 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
         strip_disallowed_tags=False,
         strip_html_comments=True,
         css_sanitizer=None,
+        drop_tags=None,
+        drop_callbacks=None,
     ):
         """Creates a BleachSanitizerFilter instance
 
@@ -298,6 +357,15 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
         :arg CSSSanitizer css_sanitizer: instance with a "sanitize_css" method for
             sanitizing style attribute values and style text; defaults to None
 
+        :arg drop_tags: tags whose entire subtree is dropped from the output;
+            items can be tag names (strings) for HTML elements or
+            ``(namespace, tag)`` tuples; defaults to None
+
+        :arg drop_callbacks: list of callables that take a tag token and
+            return True if that tag's entire subtree should be dropped;
+            callbacks can only remove content--they can't allow tags that
+            aren't otherwise allowed; defaults to None
+
         """
         # NOTE(willkg): This is the superclass of
         # html5lib.filters.sanitizer.Filter. We call this directly skipping the
@@ -318,8 +386,31 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
         self.css_sanitizer = css_sanitizer
         self.svg_allow_local_href = svg_allow_local_href
 
+        self.drop_tags = drop_tag_set(drop_tags)
+        self.drop_callbacks = list(drop_callbacks or [])
+
     def sanitize_stream(self, token_iterator):
+        drop_depth = 0
         for token in token_iterator:
+            token_type = token["type"]
+
+            if drop_depth:
+                # We're inside a dropped subtree. The token stream comes from
+                # walking the parsed tree, so start/end tags are balanced and
+                # we track nesting depth to find the end of the subtree.
+                if token_type == "StartTag":
+                    drop_depth += 1
+                elif token_type == "EndTag":
+                    drop_depth -= 1
+                continue
+
+            if token_type in ("StartTag", "EmptyTag") and self.should_drop_token(
+                token
+            ):
+                if token_type == "StartTag":
+                    drop_depth = 1
+                continue
+
             ret = self.sanitize_token(token)
 
             if not ret:
@@ -329,6 +420,23 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
                 yield from ret
             else:
                 yield ret
+
+    def should_drop_token(self, token):
+        """Returns whether the subtree for this tag token should be dropped
+
+        Drop decisions are made on the parsed tree, so this only ever sees
+        tags that survived tokenizing (allowed tags and drop_tags) and can
+        only remove content--never allow something that isn't allowed.
+
+        """
+        if (token.get("namespace"), token["name"]) in self.drop_tags:
+            return True
+
+        for callback in self.drop_callbacks:
+            if callback(token):
+                return True
+
+        return False
 
     def merge_characters(self, token_iterator):
         """Merge consecutive Characters tokens in a stream"""

@@ -358,6 +358,154 @@ def test_stripping_tags_is_safe(data, expected):
     assert clean(data, strip=True) == expected
 
 
+@pytest.mark.parametrize(
+    "data, expected",
+    [
+        # Dropped tag, its attributes and its contents are all removed
+        ("a<script>alert(1)</script>b", "ab"),
+        ('a<script data-x="1">alert(1)</script>b', "ab"),
+        ("x<style>p{color:red}</style>y", "xy"),
+        # Raw text contents don't confuse the parser
+        ('a<script>if (x<1){s="</div><b>"}</script>b', "ab"),
+        # Empty dropped elements
+        ("a<script></script>b", "ab"),
+        # HTML5 parsing puts the tail of "<script/>" inside the script
+        # element, so it gets dropped, too
+        ("a<script/>b", "a"),
+        # Nested raw text elements: the first "</style>" ends the element, so
+        # "z" is text after it and is preserved
+        ("a<style>x<style>y</style>z</style>b", "azb"),
+        # Misnested markup is resolved by the parser first
+        ("<b>bold<script>x</b>y</script>after", "<b>boldafter</b>"),
+        # Foster-parented script in a table is dropped; the table stays
+        (
+            "<table><script>evil</script><tr><td>cell</td></tr></table>after",
+            "<table><tbody><tr><td>cell</td></tr></tbody></table>after",
+        ),
+        # Text adjacent to dropped containers is preserved
+        ("before<script>x</script>after", "beforeafter"),
+        ("a <script>x</script> b", "a  b"),
+    ],
+)
+def test_drop_tags(data, expected):
+    cleaner = Cleaner(
+        tags={"b", "div", "span", "table", "tbody", "tr", "td"},
+        drop_tags={"script", "style"},
+    )
+    assert cleaner.clean(data) == expected
+
+
+def test_drop_tags_nested_dropped_regions():
+    cleaner = Cleaner(tags=set(), drop_tags={"span"})
+    assert cleaner.clean("a<span>x<span>y</span>z</span>b") == "ab"
+
+    cleaner = Cleaner(tags={"div"}, drop_tags={"div"})
+    assert cleaner.clean("a<div>x<div>y</div>z</div>c") == "ac"
+
+
+def test_drop_tags_void_element():
+    cleaner = Cleaner(tags={"br"}, drop_tags={"br"})
+    assert cleaner.clean("a<br>b") == "ab"
+
+
+def test_drop_tags_svg_namespace():
+    """(namespace, tag) tuples only drop elements in that namespace"""
+    cleaner = Cleaner(tags={"svg", "circle"}, drop_tags={("svg", "script")})
+    assert (
+        cleaner.clean("<svg><script>evil()</script><circle/></svg>ok")
+        == "<svg><circle></circle></svg>ok"
+    )
+
+    # HTML script is not matched by the svg-namespaced drop tag, so it's
+    # escaped as a disallowed tag
+    cleaner = Cleaner(tags=set(), drop_tags={("svg", "script")})
+    assert (
+        cleaner.clean("<script>kept</script><svg><script>gone</script></svg>")
+        == "&lt;script&gt;kept&lt;/script&gt;&lt;svg&gt;&lt;script&gt;gone&lt;/script&gt;&lt;/svg&gt;"
+    )
+
+
+def test_drop_tags_full_namespace_uri():
+    cleaner = Cleaner(
+        tags={"svg", "circle"},
+        drop_tags={("http://www.w3.org/2000/svg", "style")},
+    )
+    assert (
+        cleaner.clean("<svg><style>*{}</style><circle/></svg>ok")
+        == "<svg><circle></circle></svg>ok"
+    )
+
+
+def test_drop_tags_coexists_with_strip():
+    # Disallowed tags are stripped (contents kept) while dropped tags are
+    # removed with their contents
+    cleaner = Cleaner(tags=set(), strip=True, drop_tags={"script"})
+    assert cleaner.clean("<u>under</u><script>gone</script>") == "under"
+
+    # Disallowed tags are escaped while dropped tags are removed
+    cleaner = Cleaner(tags=set(), strip=False, drop_tags={"script"})
+    assert cleaner.clean("<u>under</u><script>gone</script>") == "&lt;u&gt;under&lt;/u&gt;"
+
+
+def test_drop_tags_wins_over_allowed():
+    cleaner = Cleaner(tags={"b"}, drop_tags={"b"})
+    assert cleaner.clean("<b>gone</b>") == ""
+
+
+def test_drop_tags_no_drop_tags_configured():
+    # Without drop_tags, behavior is unchanged
+    cleaner = Cleaner(tags=set())
+    assert cleaner.clean("<script>evil</script>ok") == "&lt;script&gt;evil&lt;/script&gt;ok"
+
+
+def test_drop_tags_dropped_content_skips_filters():
+    """Dropped content never reaches filters like LinkifyFilter"""
+    from bleach.linkifier import LinkifyFilter
+
+    cleaner = Cleaner(tags={"a"}, drop_tags={"script"}, filters=[LinkifyFilter])
+    assert (
+        cleaner.clean("<script>http://evil.example.com</script> http://ok.example.com")
+        == ' <a href="http://ok.example.com" rel="nofollow">http://ok.example.com</a>'
+    )
+
+
+def test_drop_callbacks():
+    def drop_private(token):
+        return token["data"].get((None, "data-private")) is not None
+
+    cleaner = Cleaner(tags={"div", "b"}, drop_callbacks=[drop_private])
+    assert (
+        cleaner.clean('<div data-private="1">secret <b>x</b></div>public') == "public"
+    )
+    assert cleaner.clean("<div>kept</div>") == "<div>kept</div>"
+
+
+def test_drop_callbacks_can_drop_allowed_tags():
+    cleaner = Cleaner(tags={"b", "i"}, drop_callbacks=[lambda token: token["name"] == "b"])
+    assert cleaner.clean("<b>gone</b><i>kept</i>") == "<i>kept</i>"
+
+
+def test_drop_callbacks_cannot_allow_disallowed_tags():
+    """Callbacks only make drop decisions--they can't allow disallowed tags"""
+    cleaner = Cleaner(tags=set(), drop_callbacks=[lambda token: False])
+    assert (
+        cleaner.clean("<script>evil</script>ok") == "&lt;script&gt;evil&lt;/script&gt;ok"
+    )
+
+    # A callback that would drop a disallowed tag never sees it because the
+    # tag doesn't survive tokenizing
+    cleaner = Cleaner(
+        tags=set(), drop_callbacks=[lambda token: token["name"] == "script"]
+    )
+    assert (
+        cleaner.clean("<script>evil</script>ok") == "&lt;script&gt;evil&lt;/script&gt;ok"
+    )
+
+
+def test_drop_tags_clean_function():
+    assert clean("a<script>alert(1)</script>b", drop_tags={"script"}) == "ab"
+
+
 def test_href_with_wrong_tag():
     assert clean('<em href="fail">no link</em>') == "<em>no link</em>"
 

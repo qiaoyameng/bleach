@@ -27,6 +27,8 @@ def clean(
     strip=False,
     strip_comments=True,
     css_sanitizer=None,
+    drop_tags=None,
+    drop_callbacks=None,
 ):
     """Clean an HTML fragment of malicious content and return it
 
@@ -68,6 +70,16 @@ def clean(
     :arg CSSSanitizer css_sanitizer: instance with a "sanitize_css" method for
         sanitizing style attribute values and style text; defaults to None
 
+    :arg drop_tags: tags whose entire subtree (the tag, its attributes and all
+        of its contents) is dropped from the output; items can be tag names
+        (strings) for HTML elements or ``(namespace, tag)`` tuples; defaults
+        to None
+
+    :arg drop_callbacks: list of callables that take a tag token and return
+        True if that tag's entire subtree should be dropped; callbacks can
+        only remove content--they can't allow tags that aren't in ``tags`` or
+        ``drop_tags``; defaults to None
+
     :returns: cleaned text as unicode
 
     """
@@ -78,6 +90,8 @@ def clean(
         strip=strip,
         strip_comments=strip_comments,
         css_sanitizer=css_sanitizer,
+        drop_tags=drop_tags,
+        drop_callbacks=drop_callbacks,
     )
     return cleaner.clean(text)
 

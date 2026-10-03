@@ -271,6 +271,68 @@ If you would rather Bleach stripped this markup entirely, you can pass
    '<b>is not allowed</b>'
 
 
+Dropping subtrees (``drop_tags`` and ``drop_callbacks``)
+=========================================================
+
+Escaping and stripping both keep the text contents of a tag. Sometimes you
+want the whole subtree gone--for example ``script`` and ``style`` contents or
+containers marked as private. Pass ``drop_tags`` to drop those tags, their
+attributes and everything inside them:
+
+.. doctest::
+
+   >>> import bleach
+
+   >>> bleach.clean('a<script>alert(1)</script>b', drop_tags={'script'})
+   'ab'
+
+   >>> bleach.clean('x<style>p{color:red}</style>y', drop_tags={'style'})
+   'xy'
+
+Drop decisions are made on the parsed HTML5 tree, so raw text, misnesting,
+unclosed tags and table foster parenting are all handled the same way a
+browser would handle them. Dropped content is removed before any filters
+run, so it never reaches ``LinkifyFilter`` or other filters.
+
+``drop_tags`` items are tag names for HTML elements. To drop elements in
+another namespace, use a ``(namespace, tag)`` tuple with a namespace URI or
+a prefix like ``"svg"``:
+
+.. doctest::
+
+   >>> import bleach
+
+   >>> bleach.clean(
+   ...     '<svg><script>evil()</script><circle/></svg>ok',
+   ...     tags={'svg', 'circle'},
+   ...     drop_tags={('svg', 'script')},
+   ... )
+   '<svg><circle></circle></svg>ok'
+
+For conditional dropping, pass ``drop_callbacks``--a list of callables that
+take the tag token and return ``True`` to drop the subtree:
+
+.. doctest::
+
+   >>> import bleach
+
+   >>> def drop_private(token):
+   ...     return token['data'].get((None, 'data-private')) is not None
+
+   >>> bleach.clean(
+   ...     '<div data-private="1">secret</div>public',
+   ...     tags={'div'},
+   ...     drop_callbacks=[drop_private],
+   ... )
+   'public'
+
+.. Note::
+
+   Drop callbacks can only remove content. They only see tags that survive
+   tokenizing (allowed tags and ``drop_tags``), so they can't be used to
+   allow tags that aren't allowed.
+
+
 Stripping comments (``strip_comments``)
 =======================================
 

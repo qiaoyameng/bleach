@@ -1,6 +1,22 @@
 Bleach changes
 ==============
 
+Version 6.5.0 (in development)
+------------------------------
+
+**Features**
+
+* Add ``drop_tags`` and ``drop_callbacks`` arguments to ``bleach.clean``,
+  ``bleach.sanitizer.Cleaner`` and ``bleach.sanitizer.BleachSanitizerFilter``
+  for dropping entire element subtrees (the tag, its attributes and all of
+  its contents) from the output.
+
+  Drop decisions are made on the parsed HTML5 tree, so raw text elements,
+  misnesting and table foster parenting are handled correctly. Dropped
+  content is removed before filters run, so it never reaches
+  ``LinkifyFilter`` or other filters. Drop callbacks can only remove
+  content--they can't allow tags that aren't allowed.
+
 Version 6.4.0 (June 5th, 2026)
 ------------------------------
 
