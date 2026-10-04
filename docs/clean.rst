@@ -330,6 +330,42 @@ For example:
 Defaults are stored in ``bleach.css_sanitizer.ALLOWED_CSS_PROPERTIES`` and
 ``bleach.css_sanitizer.ALLOWED_SVG_PROPERTIES``.
 
+Allowing CSS custom properties (variables)
+------------------------------------------
+
+By default, ``var()`` references are left untouched. You can opt into
+resolving a small set of CSS custom properties by passing
+``allowed_css_variables`` to
+:py:class:`bleach.css_sanitizer.CSSSanitizer`. This is a dict mapping the
+variable name to the value type its resolved value must match. Valid types
+are stored in ``bleach.css_sanitizer.ALLOWED_CSS_VARIABLE_VALUE_TYPES``.
+
+.. doctest::
+
+   >>> from bleach.css_sanitizer import CSSSanitizer
+
+   >>> css_sanitizer = CSSSanitizer(
+   ...     allowed_css_properties=["color", "width"],
+   ...     allowed_css_variables={"--accent": "color", "--spacing": "length"},
+   ... )
+
+   >>> css_sanitizer.sanitize_css("--accent: red; color: var(--accent);")
+   'color: red;'
+
+Resolution happens within the single ``style`` attribute value only:
+
+* Definitions follow cascade order and ``!important`` within the block; the
+  winning definition is validated against its declared value type.
+* ``var()`` references support nested fallbacks and references to other
+  allowed variables; cyclic dependencies are invalid and fall back to the
+  ``var()`` fallback or cause the declaration to be dropped.
+* Variables from external stylesheets or ancestor inheritance are not
+  resolved; references to them use the fallback or are dropped.
+* Custom property definitions themselves are never emitted.
+* Resolved values are checked for dangerous constructs (for example
+  ``expression()`` and ``url()`` with disallowed schemes), so variables
+  cannot be used to smuggle values past the sanitizer.
+
 .. Note::
 
    This silently drops ParseError and AtRule tokens in CSS parsing. If you need
