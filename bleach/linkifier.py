@@ -110,6 +110,7 @@ class Linker:
         url_re=URL_RE,
         email_re=EMAIL_RE,
         recognized_tags=html5lib_shim.HTML_TAGS,
+        url_policy=None,
     ):
         """Creates a Linker instance
 
@@ -130,7 +131,10 @@ class Linker:
         :arg set recognized_tags: the set of tags that linkify knows about;
             everything else gets escaped
 
-        :returns: linkified text as unicode
+        :arg url_policy: :class:`bleach.url_policy.URLPolicy` instance used to
+            validate the ``href`` of every emitted ``<a>`` tag, including
+            links generated from bare URLs and email addresses; links that
+            the policy rejects are emitted as plain text
 
         """
         self.callbacks = callbacks
@@ -138,6 +142,7 @@ class Linker:
         self.parse_email = parse_email
         self.url_re = url_re
         self.email_re = email_re
+        self.url_policy = url_policy
 
         # Create a parser/tokenizer that allows all HTML tags and escapes
         # anything not in that list.
@@ -184,6 +189,7 @@ class Linker:
             parse_email=self.parse_email,
             url_re=self.url_re,
             email_re=self.email_re,
+            url_policy=self.url_policy,
         )
         return self.serializer.render(filtered)
 
@@ -210,6 +216,7 @@ class LinkifyFilter(html5lib_shim.Filter):
         parse_email=False,
         url_re=URL_RE,
         email_re=EMAIL_RE,
+        url_policy=None,
     ):
         """Creates a LinkifyFilter instance
 
@@ -228,6 +235,9 @@ class LinkifyFilter(html5lib_shim.Filter):
 
         :arg email_re: email matching regex
 
+        :arg url_policy: :class:`bleach.url_policy.URLPolicy` instance used to
+            validate the href of emitted links
+
         """
         super().__init__(source)
 
@@ -237,6 +247,7 @@ class LinkifyFilter(html5lib_shim.Filter):
 
         self.url_re = url_re
         self.email_re = email_re
+        self.url_policy = url_policy
 
     def apply_callbacks(self, attrs, is_new):
         """Given an attrs dict and an is_new bool, runs through callbacks
@@ -256,6 +267,17 @@ class LinkifyFilter(html5lib_shim.Filter):
             attrs = cb(attrs, is_new)
             if attrs is None:
                 return None
+
+        if self.url_policy is not None:
+            href_key = (None, "href")
+            if href_key in attrs:
+                result = self.url_policy.check(
+                    "a", "href", attrs[href_key], namespace=None
+                )
+                if not result.allowed:
+                    return None
+                attrs[href_key] = result.value
+
         return attrs
 
     def extract_character_data(self, token_list):

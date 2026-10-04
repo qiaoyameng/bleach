@@ -83,6 +83,29 @@ This defaults to ``bleach.linkifier.DEFAULT_CALLBACKS``.
    In previous versions of Bleach, the attribute names were not namespaced.
 
 
+Validating link URLs (``url_policy``)
+-------------------------------------
+
+Passing a :py:class:`bleach.url_policy.URLPolicy` to :py:class:`Linker`
+checks the ``href`` of every ``<a>`` tag--including links generated from bare
+URLs and email addresses--through the same entry point used by
+``Cleaner``.  Links the policy rejects (or that a rewrite callback turns into
+a disallowed URL) are emitted as plain text.
+
+.. doctest::
+
+   >>> from bleach.linkifier import Linker
+   >>> from bleach.url_policy import URLPolicy
+
+   >>> policy = URLPolicy(
+   ...     base_url="https://www.example.com/",
+   ...     origins={"link": ["self"], "default": ["self"]},
+   ... )
+   >>> Linker(url_policy=policy).linkify('see https://other.example/ here')
+   'see https://other.example/ here'
+
+
+
 Setting Attributes
 ------------------
 

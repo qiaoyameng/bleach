@@ -5,7 +5,7 @@ import warnings
 from xml.sax.saxutils import unescape
 
 from bleach import html5lib_shim
-from bleach import parse_shim
+from bleach import url_policy
 
 
 #: Set of allowed tags
@@ -92,6 +92,7 @@ class Cleaner:
         strip_comments=True,
         filters=None,
         css_sanitizer=None,
+        url_policy=None,
     ):
         """Initializes a Cleaner
 
@@ -120,6 +121,10 @@ class Cleaner:
         :arg CSSSanitizer css_sanitizer: instance with a "sanitize_css" method for
             sanitizing style attribute values and style text; defaults to None
 
+        :arg url_policy: :class:`bleach.url_policy.URLPolicy` instance used to
+            validate (and possibly rewrite) every URI-valued attribute; when
+            None only the protocol is checked as before
+
         """
         self.tags = tags
         self.attributes = attributes
@@ -128,6 +133,7 @@ class Cleaner:
         self.strip_comments = strip_comments
         self.filters = filters or []
         self.css_sanitizer = css_sanitizer
+        self.url_policy = url_policy
 
         self.parser = html5lib_shim.BleachHTMLParser(
             tags=self.tags,
@@ -197,6 +203,7 @@ class Cleaner:
             strip_html_comments=self.strip_comments,
             css_sanitizer=self.css_sanitizer,
             allowed_protocols=self.protocols,
+            url_policy=self.url_policy,
         )
 
         # Apply any filters after the BleachSanitizerFilter
@@ -268,6 +275,7 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
         strip_disallowed_tags=False,
         strip_html_comments=True,
         css_sanitizer=None,
+        url_policy=None,
     ):
         """Creates a BleachSanitizerFilter instance
 
@@ -298,6 +306,9 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
         :arg CSSSanitizer css_sanitizer: instance with a "sanitize_css" method for
             sanitizing style attribute values and style text; defaults to None
 
+        :arg url_policy: :class:`bleach.url_policy.URLPolicy` instance used to
+            validate (and possibly rewrite) URI-valued attributes
+
         """
         # NOTE(willkg): This is the superclass of
         # html5lib.filters.sanitizer.Filter. We call this directly skipping the
@@ -317,6 +328,7 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
         self.svg_attr_val_allows_ref = svg_attr_val_allows_ref
         self.css_sanitizer = css_sanitizer
         self.svg_allow_local_href = svg_allow_local_href
+        self.url_policy = url_policy
 
     def sanitize_stream(self, token_iterator):
         for token in token_iterator:
@@ -484,50 +496,8 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
         # NOTE(willkg): This transforms the value into a normalized one that's
         # easier to match and verify, but shouldn't get returned since it's
         # vastly different than the original value.
-
-        # Convert all character entities in the value
-        normalized_uri = html5lib_shim.convert_entities(value)
-
-        # Strip backtick, whitespace, and control characters
-        normalized_uri = re.sub(r"[`\000-\040\177-\240\s]+", "", normalized_uri)
-
-        # Strip non-ASCII characters so that urlparse can parse the url into
-        # components correctly. This drops invisible and whitespace unicode
-        # characters among other things.
-        normalized_uri = re.sub(r"[^\x00-\x7f]", "", normalized_uri)
-
-        # Lowercase value to make matching easier
-        normalized_uri = normalized_uri.lower()
-
-        try:
-            # Drop attributes with uri values that have protocols that aren't
-            # allowed
-            parsed = parse_shim.urlparse(normalized_uri)
-        except ValueError:
-            # URI is impossible to parse, therefore it's not allowed
-            return None
-
-        if parsed.scheme:
-            # If urlparse found a scheme, check that
-            if parsed.scheme in allowed_protocols:
-                return value
-
-        else:
-            # Allow uris that are just an anchor
-            if normalized_uri.startswith("#"):
-                return value
-
-            # Handle protocols that urlparse doesn't recognize like "myprotocol"
-            if (
-                ":" in normalized_uri
-                and normalized_uri.split(":")[0] in allowed_protocols
-            ):
-                return value
-
-            # If there's no protocol/scheme specified, then assume it's "http" or
-            # "https" and see if that's allowed
-            if "http" in allowed_protocols or "https" in allowed_protocols:
-                return value
+        if url_policy.validate_protocol(value, allowed_protocols):
+            return value
 
         return None
 
@@ -551,13 +521,25 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
                 if not self.attr_filter(token["name"], name, val):
                     continue
 
-                # Drop attributes with uri values that use a disallowed protocol
-                # Sanitize attributes with uri values
+                # Drop attributes with uri values that use a disallowed
+                # protocol or resolve to a disallowed origin; sanitize the
+                # remaining uri values (possibly rewriting them, e.g. for a
+                # CDN)
                 if namespaced_name in self.attr_val_is_uri:
-                    new_value = self.sanitize_uri_value(val, self.allowed_protocols)
-                    if new_value is None:
-                        continue
-                    val = new_value
+                    if self.url_policy is not None:
+                        result = self.url_policy.check(
+                            token["name"], name, val, namespace=namespace
+                        )
+                        if not result.allowed:
+                            continue
+                        val = result.value
+                    else:
+                        new_value = self.sanitize_uri_value(
+                            val, self.allowed_protocols
+                        )
+                        if new_value is None:
+                            continue
+                        val = new_value
 
                 # Drop values in svg attrs with non-local IRIs
                 if namespaced_name in self.svg_attr_val_allows_ref:
