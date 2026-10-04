@@ -92,6 +92,7 @@ class Cleaner:
         strip_comments=True,
         filters=None,
         css_sanitizer=None,
+        constraints=None,
     ):
         """Initializes a Cleaner
 
@@ -120,6 +121,16 @@ class Cleaner:
         :arg CSSSanitizer css_sanitizer: instance with a "sanitize_css" method for
             sanitizing style attribute values and style text; defaults to None
 
+        :arg list constraints: list of node constraint callables run after
+            cleaning (and any ``filters``) on the HTML5-repaired tree; each
+            callable receives a
+            :py:class:`bleach.constraints.NodeContext` and may drop node
+            attributes, restrict token-list attributes, adjust type-checked
+            values, or return a drop/unwrap structural action. Values added
+            or changed by constraints are re-checked against the attribute
+            allow-list, protocol and CSS rules. Defaults to ``None`` which
+            disables the phase entirely.
+
         """
         self.tags = tags
         self.attributes = attributes
@@ -128,6 +139,7 @@ class Cleaner:
         self.strip_comments = strip_comments
         self.filters = filters or []
         self.css_sanitizer = css_sanitizer
+        self.constraints = list(constraints) if constraints else []
 
         self.parser = html5lib_shim.BleachHTMLParser(
             tags=self.tags,
@@ -202,6 +214,24 @@ class Cleaner:
         # Apply any filters after the BleachSanitizerFilter
         for filter_class in self.filters:
             filtered = filter_class(source=filtered)
+
+        # Node constraints run last so they operate on the HTML5-repaired
+        # tree and see everything the other filters (e.g. LinkifyFilter)
+        # produced.
+        if self.constraints:
+            from bleach.constraints import BleachConstraintFilter
+
+            filtered = BleachConstraintFilter(
+                source=filtered,
+                constraints=self.constraints,
+                allowed_tags=self.tags,
+                attributes=self.attributes,
+                allowed_protocols=self.protocols,
+                attr_val_is_uri=html5lib_shim.attr_val_is_uri,
+                svg_attr_val_allows_ref=html5lib_shim.svg_attr_val_allows_ref,
+                svg_allow_local_href=html5lib_shim.svg_allow_local_href,
+                css_sanitizer=self.css_sanitizer,
+            )
 
         return self.serializer.render(filtered)
 
@@ -542,63 +572,79 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
             # we're keeping.
             attrs = {}
             for namespaced_name, val in token["data"].items():
-                namespace, name = namespaced_name
-
-                # Drop attributes that are not explicitly allowed
-                #
-                # NOTE(willkg): We pass in the attribute name--not a namespaced
-                # name.
-                if not self.attr_filter(token["name"], name, val):
+                new_value = self.sanitize_attribute(
+                    token["name"], namespaced_name, val
+                )
+                if new_value is None:
                     continue
-
-                # Drop attributes with uri values that use a disallowed protocol
-                # Sanitize attributes with uri values
-                if namespaced_name in self.attr_val_is_uri:
-                    new_value = self.sanitize_uri_value(val, self.allowed_protocols)
-                    if new_value is None:
-                        continue
-                    val = new_value
-
-                # Drop values in svg attrs with non-local IRIs
-                if namespaced_name in self.svg_attr_val_allows_ref:
-                    new_val = re.sub(r"url\s*\(\s*[^#\s][^)]+?\)", " ", unescape(val))
-                    new_val = new_val.strip()
-                    if not new_val:
-                        continue
-
-                    else:
-                        # Replace the val with the unescaped version because
-                        # it's a iri
-                        val = new_val
-
-                # Drop href and xlink:href attr for svg elements with non-local IRIs
-                if (None, token["name"]) in self.svg_allow_local_href:
-                    if namespaced_name in [
-                        (None, "href"),
-                        (html5lib_shim.namespaces["xlink"], "href"),
-                    ]:
-                        if re.search(r"^\s*[^#\s]", val):
-                            continue
-
-                # If it's a style attribute, sanitize it
-                if namespaced_name == (None, "style"):
-                    if self.css_sanitizer:
-                        val = self.css_sanitizer.sanitize_css(val)
-                    else:
-                        # FIXME(willkg): if style is allowed, but no
-                        # css_sanitizer was set up, then this is probably a
-                        # mistake and we should raise an error here
-                        #
-                        # For now, we're going to set the value to "" because
-                        # there was no sanitizer set
-                        val = ""
-
-                # At this point, we want to keep the attribute, so add it in
-                attrs[namespaced_name] = val
+                attrs[namespaced_name] = new_value
 
             token["data"] = attrs
 
         return token
+
+    def sanitize_attribute(self, tag_name, namespaced_name, value):
+        """Runs one attribute through the full allow/protocol/CSS checks
+
+        This is shared by the initial sanitizing pass and the node constraint
+        phase so that values added or changed by constraints cannot bypass the
+        attribute allow-list, the protocol rules or CSS restrictions.
+
+        :arg str tag_name: local name of the element carrying the attribute
+        :arg tuple namespaced_name: ``(namespace, name)`` of the attribute
+        :arg str value: the candidate attribute value
+
+        :returns: the sanitized value to keep, or ``None`` to drop the
+            attribute
+
+        """
+        namespace, name = namespaced_name
+
+        # Drop attributes that are not explicitly allowed
+        #
+        # NOTE(willkg): We pass in the attribute name--not a namespaced
+        # name.
+        if not self.attr_filter(tag_name, name, value):
+            return None
+
+        # Drop attributes with uri values that use a disallowed protocol
+        # Sanitize attributes with uri values
+        if namespaced_name in self.attr_val_is_uri:
+            value = self.sanitize_uri_value(value, self.allowed_protocols)
+            if value is None:
+                return None
+
+        # Drop values in svg attrs with non-local IRIs
+        if namespaced_name in self.svg_attr_val_allows_ref:
+            new_val = re.sub(r"url\s*\(\s*[^#\s][^)]+?\)", " ", unescape(value))
+            new_val = new_val.strip()
+            if not new_val:
+                return None
+            value = new_val
+
+        # Drop href and xlink:href attr for svg elements with non-local IRIs
+        if (None, tag_name) in self.svg_allow_local_href:
+            if namespaced_name in [
+                (None, "href"),
+                (html5lib_shim.namespaces["xlink"], "href"),
+            ]:
+                if re.search(r"^\s*[^#\s]", value):
+                    return None
+
+        # If it's a style attribute, sanitize it
+        if namespaced_name == (None, "style"):
+            if self.css_sanitizer:
+                value = self.css_sanitizer.sanitize_css(value)
+            else:
+                # FIXME(willkg): if style is allowed, but no
+                # css_sanitizer was set up, then this is probably a
+                # mistake and we should raise an error here
+                #
+                # For now, we're going to set the value to "" because
+                # there was no sanitizer set
+                value = ""
+
+        return value
 
     def disallowed_token(self, token):
         token_type = token["type"]

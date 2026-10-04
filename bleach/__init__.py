@@ -27,6 +27,7 @@ def clean(
     strip=False,
     strip_comments=True,
     css_sanitizer=None,
+    constraints=None,
 ):
     """Clean an HTML fragment of malicious content and return it
 
@@ -68,6 +69,10 @@ def clean(
     :arg CSSSanitizer css_sanitizer: instance with a "sanitize_css" method for
         sanitizing style attribute values and style text; defaults to None
 
+    :arg list constraints: list of node constraint callables run as the final
+        cleaning phase on the HTML5-repaired tree; see
+        :py:mod:`bleach.constraints`; defaults to None
+
     :returns: cleaned text as unicode
 
     """
@@ -78,6 +83,7 @@ def clean(
         strip=strip,
         strip_comments=strip_comments,
         css_sanitizer=css_sanitizer,
+        constraints=constraints,
     )
     return cleaner.clean(text)
 

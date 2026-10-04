@@ -1,6 +1,22 @@
 Bleach changes
 ==============
 
+Unreleased
+----------
+
+**New features**
+
+* Add an opt-in node constraint phase to ``Cleaner`` (``constraints``
+  argument). Rules run after cleaning (and any filters, including
+  ``LinkifyFilter``) on the HTML5-repaired tree, receive the filtered
+  attributes plus read-only ancestor context, and may drop attributes,
+  restrict token lists, adjust type-checked values, or drop/unwrap nodes.
+  Attribute values added or changed by rules are re-checked against the
+  attribute allow-list, protocol and CSS rules. Bundled rules
+  ``RequireRelForBlankTarget``, ``ClampTableCellSpan`` and
+  ``RequireImageAlt`` live in the new ``bleach.constraints`` module; no
+  business rule is enabled by default.
+
 Version 6.4.0 (June 5th, 2026)
 ------------------------------
 

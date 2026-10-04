@@ -358,6 +358,226 @@ should create a :py:class:`bleach.sanitizer.Cleaner` instance.
 .. versionadded:: 2.0
 
 
+Node constraints (``constraints``)
+==================================
+
+Some rules are awkward to express with per-attribute allow-list callables
+because they need the whole element together with its position in the tree:
+"links with ``target="_blank"`` must carry specific ``rel`` tokens",
+"table-cell ``rowspan``/``colspan`` must stay in range", or "keep an image
+only when it has non-empty ``alt`` text".
+
+The ``constraints`` argument adds an explicit, opt-in rule phase. It runs
+**after** the regular sanitizing pass (and any ``filters``) against the
+**HTML5-repaired** tree. Each rule is a callable receiving one
+:py:class:`bleach.constraints.NodeContext` per element. The context exposes
+the element's already-filtered attributes and read-only ancestor
+information.
+
+A rule can:
+
+* delete node attributes (``ctx.del_attr``),
+* restrict token-list attributes such as ``rel`` to a set of tokens,
+* adjust a value after type checking (``ctx.set_attr``),
+* return a structural action to drop or unwrap the node.
+
+Any value a rule adds or changes is re-run through the same attribute
+machinery used by the regular pass, so it cannot bypass the attribute
+allow-list, the protocol rules or CSS restrictions. Rules execute in
+declaration order and repeat cleaning is idempotent. The phase is disabled by
+default; these business rules are never global ``Cleaner`` defaults.
+
+.. autoclass:: bleach.constraints.NodeContext
+   :members:
+
+.. autoclass:: bleach.constraints.NodeAction
+   :members:
+
+Bundled, opt-in rules
+---------------------
+
+This example wires up the three rules from above. Note that ``rel`` and
+``target`` must be allowed in ``attributes`` for the rules to keep or add
+them.
+
+.. doctest::
+
+   >>> from bleach.sanitizer import Cleaner
+   >>> from bleach.constraints import (
+   ...     RequireRelForBlankTarget,
+   ...     ClampTableCellSpan,
+   ...     RequireImageAlt,
+   ... )
+
+   >>> TAGS = ['a', 'img', 'table', 'tbody', 'tr', 'td', 'th']
+   >>> ATTRS = {
+   ...     'a': ['href', 'target', 'rel'],
+   ...     'img': ['src', 'alt'],
+   ...     'td': ['colspan', 'rowspan'],
+   ...     'th': ['colspan', 'rowspan'],
+   ... }
+   >>> cleaner = Cleaner(
+   ...     tags=TAGS,
+   ...     attributes=ATTRS,
+   ...     constraints=[
+   ...         RequireRelForBlankTarget(),
+   ...         ClampTableCellSpan(),
+   ...         RequireImageAlt(),
+   ...     ],
+   ... )
+
+``RequireRelForBlankTarget`` matches ``target`` case-insensitively ignoring
+surrounding whitespace, strips ``rel`` tokens outside its allow-list, and
+appends the required tokens. Links that do not open a new browsing context
+are untouched:
+
+.. doctest::
+
+   >>> cleaner.clean('<a href="https://example.com" target="_blank">home</a>')
+   '<a href="https://example.com" target="_blank" rel="noopener noreferrer">home</a>'
+
+   >>> cleaner.clean('<a href="https://example.com" target="_blank" rel="stylesheet external">home</a>')
+   '<a href="https://example.com" target="_blank" rel="external noopener noreferrer">home</a>'
+
+   >>> cleaner.clean('<a href="https://example.com" target="_self" rel="stylesheet">home</a>')
+   '<a href="https://example.com" target="_self" rel="stylesheet">home</a>'
+
+Both the required tokens and the allowed tokens are configurable:
+
+.. doctest::
+
+   >>> rule = RequireRelForBlankTarget(
+   ...     required_tokens=('nofollow',),
+   ...     allowed_tokens=('nofollow', 'ugc', 'sponsored'),
+   ... )
+
+``ClampTableCellSpan`` applies HTML limits by default (``colspan`` up to
+1000, ``rowspan`` up to 65534). Over-large values are clamped; values that
+are not valid non-negative integers cause the attribute to be deleted (HTML
+then treats the span as 1):
+
+.. doctest::
+
+   >>> cleaner.clean("<table><tbody><tr><td colspan='9999'>x</td><td rowspan='zero'>y</td></tr></tbody></table>")
+   '<table><tbody><tr><td colspan="1000">x</td><td>y</td></tr></tbody></table>'
+
+Boundary values are kept and out-of-range values are fixed:
+
+.. doctest::
+
+   >>> cleaner.clean("<table><tbody><tr><td colspan='1000' rowspan='65534'>x</td><td colspan='1001' rowspan='65535'>y</td></tr></tbody></table>")
+   '<table><tbody><tr><td colspan="1000" rowspan="65534">x</td><td colspan="1000" rowspan="65534">y</td></tr></tbody></table>'
+
+``RequireImageAlt`` drops an image whose ``alt`` is missing, empty or
+whitespace-only. Foreign-namespace elements such as SVG ``<image>`` share the
+local name but are left alone because the rule defaults to the HTML namespace,
+which is preserved through the phase:
+
+.. doctest::
+
+   >>> cleaner.clean('<img src="cat.jpg" alt="a cat"><img src="x.jpg" alt="">')
+   '<img src="cat.jpg" alt="a cat">'
+
+Writing your own rule
+---------------------
+
+A rule is any callable taking a
+:py:class:`bleach.constraints.NodeContext`. It returns
+:py:data:`bleach.constraints.NodeAction.DROP` to remove the element and its
+subtree, :py:data:`bleach.constraints.NodeAction.UNWRAP` to remove only the
+element's tags while keeping its children, or anything else (including
+``None``) to keep it. The context provides ``tag``, ``namespace``,
+``ancestors`` and ``has_ancestor`` for read-only structural checks.
+
+.. doctest::
+
+   >>> from bleach.constraints import NodeAction
+
+   >>> def unwrap_span(ctx):
+   ...     if ctx.tag == 'span':
+   ...         return NodeAction.UNWRAP
+   ...     return NodeAction.KEEP
+   ...
+   >>> Cleaner(tags=['span', 'b'], constraints=[unwrap_span]).clean(
+   ...     '<span>a <b>b</b></span>'
+   ... )
+   'a <b>b</b>'
+
+An ancestor-aware rule:
+
+.. doctest::
+
+   >>> def drop_link_in_b(ctx):
+   ...     if ctx.tag == 'a' and ctx.has_ancestor('b'):
+   ...         return NodeAction.DROP
+   ...     return NodeAction.KEEP
+   ...
+   >>> Cleaner(
+   ...     tags=['a', 'b'],
+   ...     attributes={'a': ['href']},
+   ...     constraints=[drop_link_in_b],
+   ... ).clean('<b><a href="x">in</a></b><a href="y">out</a>')
+   '<b></b><a href="y">out</a>'
+
+New values cannot bypass safety checks. Here an injected ``onclick`` is
+removed because it is not in the allow-list, and a ``javascript:`` URL set by
+a rule is dropped by the protocol check:
+
+.. doctest::
+
+   >>> def add_handler(ctx):
+   ...     ctx.set_attr('onclick', 'alert(1)')
+   ...     return NodeAction.KEEP
+   ...
+   >>> Cleaner(
+   ...     tags=['a'],
+   ...     attributes={'a': ['href']},
+   ...     constraints=[add_handler],
+   ... ).clean('<a href="https://example.com">x</a>')
+   '<a href="https://example.com">x</a>'
+
+.. doctest::
+
+   >>> def to_javascript(ctx):
+   ...     if ctx.tag == 'a':
+   ...         ctx.set_attr('href', 'javascript:alert(1)')
+   ...     return NodeAction.KEEP
+   ...
+   >>> Cleaner(
+   ...     tags=['a'],
+   ...     attributes={'a': ['href']},
+   ...     constraints=[to_javascript],
+   ... ).clean('<a href="https://example.com">x</a>')
+   '<a>x</a>'
+
+linkify integration
+-------------------
+
+The constraint phase is stacked after all ``filters``, so links created or
+changed by :class:`bleach.linkifier.LinkifyFilter` also pass through the
+final constraints:
+
+.. doctest::
+
+   >>> from bleach import callbacks
+   >>> from bleach.linkifier import LinkifyFilter
+   >>> cleaner = Cleaner(
+   ...     tags=TAGS,
+   ...     attributes=ATTRS,
+   ...     filters=[
+   ...         lambda source: LinkifyFilter(
+   ...             source,
+   ...             callbacks=[callbacks.target_blank, callbacks.nofollow],
+   ...         )
+   ...     ],
+   ...     constraints=[RequireRelForBlankTarget()],
+   ... )
+   >>> cleaner.clean('see https://example.com please')
+   'see <a href="https://example.com" target="_blank" rel="nofollow noopener noreferrer">https://example.com</a> please'
+
+.. versionadded:: 6.4.0
+
+
 html5lib Filters (``filters``)
 ------------------------------
 
