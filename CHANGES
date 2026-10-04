@@ -1,6 +1,26 @@
 Bleach changes
 ==============
 
+Unreleased
+----------
+
+**Features**
+
+* Add ``allowed_css_variables`` and ``allowed_url_protocols`` arguments to
+  ``bleach.css_sanitizer.CSSSanitizer`` for allowing a declared set of CSS
+  custom properties (variables).
+
+  Variables are resolved within the single style declaration block:
+  ``var()`` references (including nested fallbacks) are substituted using
+  the tinycss2 token tree, override order and ``!important`` are honored,
+  dependency cycles are dropped, and unresolvable external variables fall
+  back to a valid fallback or cause the declaration to be removed.
+  Resolved values must pass the declared value type whitelist
+  (``color``, ``length``, ...), a safe-function whitelist and the URL
+  policy, so variables can't smuggle dangerous functions into allowed
+  properties. Default behavior is unchanged when ``allowed_css_variables``
+  is not set.
+
 Version 6.4.0 (June 5th, 2026)
 ------------------------------
 

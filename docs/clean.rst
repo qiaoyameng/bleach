@@ -346,6 +346,55 @@ Defaults are stored in ``bleach.css_sanitizer.ALLOWED_CSS_PROPERTIES`` and
 .. versionadded:: 5.0
 
 
+Allowing CSS custom properties (variables)
+------------------------------------------
+
+By default, custom property declarations (for example ``--accent: red;``)
+are dropped and declaration values are passed through untouched. If you want
+to allow a small set of CSS variables, pass ``allowed_css_variables``: a
+mapping of variable names to value types.
+
+For example:
+
+.. code-block:: python
+
+   css_sanitizer = CSSSanitizer(
+       allowed_css_properties=["color", "width"],
+       allowed_css_variables={
+           "--accent": "color",
+           "--spacing": "length",
+       },
+   )
+
+   css_sanitizer.sanitize_css("--accent: red; color: var(--accent);")
+   # returns "--accent: red; color: red;"
+
+Value types are whitelists for the resolved value: ``"color"``,
+``"length"``, ``"percentage"``, ``"number"``, ``"angle"``, ``"time"``,
+``"string"`` or ``"any"`` (see
+``bleach.css_sanitizer.CSS_VARIABLE_VALUE_TYPES``). You can also pass a
+callable taking a list of tinycss2 tokens and returning whether the value
+is allowed.
+
+Variables are resolved within the single style declaration block being
+sanitized:
+
+* ``var()`` references are substituted, including nested fallbacks such as
+  ``var(--missing, var(--accent, red))``.
+* Override order and ``!important`` within the block are honored.
+* Dependency cycles (``--a: var(--b); --b: var(--a);``) are invalid and
+  dropped.
+* External stylesheets and ancestor inheritance are deliberately *not*
+  resolved. References to variables that can't be determined locally use
+  their fallback if it's valid; otherwise the declaration is removed.
+
+Resolved values must pass the declared value type whitelist, a whitelist of
+safe functions (``rgb()``, ``hsl()``, ``calc()``, ...) and the URL policy
+(``allowed_url_protocols``, which defaults to dropping all URLs), so
+variables can't be used to smuggle dangerous functions like ``url()`` or
+``expression()`` into allowed properties.
+
+
 Using ``bleach.sanitizer.Cleaner``
 ==================================
 
