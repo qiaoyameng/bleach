@@ -1,1 +1,1 @@
-from bleach._vendor.parse import urlparse  # noqa
+from bleach._vendor.parse import urlparse, urljoin  # noqa

@@ -110,6 +110,8 @@ class Linker:
         url_re=URL_RE,
         email_re=EMAIL_RE,
         recognized_tags=html5lib_shim.HTML_TAGS,
+        url_policy=None,
+        base_url="",
     ):
         """Creates a Linker instance
 
@@ -130,6 +132,14 @@ class Linker:
         :arg set recognized_tags: the set of tags that linkify knows about;
             everything else gets escaped
 
+        :arg url_policy: callable deciding whether the href of a generated
+            link is allowed and what value to adopt; called as
+            ``url_policy("a", None, "href", value, base_url)`` and returns
+            either a ``bleach.url_policy.URLPolicyResult``, the adopted value
+            as a str, or ``None`` to leave the text unlinked; defaults to None
+
+        :arg str base_url: fixed base URL passed to the url policy
+
         :returns: linkified text as unicode
 
         """
@@ -138,6 +148,8 @@ class Linker:
         self.parse_email = parse_email
         self.url_re = url_re
         self.email_re = email_re
+        self.url_policy = url_policy
+        self.base_url = base_url
 
         # Create a parser/tokenizer that allows all HTML tags and escapes
         # anything not in that list.
@@ -184,6 +196,8 @@ class Linker:
             parse_email=self.parse_email,
             url_re=self.url_re,
             email_re=self.email_re,
+            url_policy=self.url_policy,
+            base_url=self.base_url,
         )
         return self.serializer.render(filtered)
 
@@ -210,6 +224,8 @@ class LinkifyFilter(html5lib_shim.Filter):
         parse_email=False,
         url_re=URL_RE,
         email_re=EMAIL_RE,
+        url_policy=None,
+        base_url="",
     ):
         """Creates a LinkifyFilter instance
 
@@ -228,6 +244,12 @@ class LinkifyFilter(html5lib_shim.Filter):
 
         :arg email_re: email matching regex
 
+        :arg url_policy: callable deciding whether the href of a generated
+            link is allowed and what value to adopt; see
+            :py:class:`Linker`
+
+        :arg str base_url: fixed base URL passed to the url policy
+
         """
         super().__init__(source)
 
@@ -237,6 +259,8 @@ class LinkifyFilter(html5lib_shim.Filter):
 
         self.url_re = url_re
         self.email_re = email_re
+        self.url_policy = url_policy
+        self.base_url = base_url
 
     def apply_callbacks(self, attrs, is_new):
         """Given an attrs dict and an is_new bool, runs through callbacks
@@ -256,6 +280,33 @@ class LinkifyFilter(html5lib_shim.Filter):
             attrs = cb(attrs, is_new)
             if attrs is None:
                 return None
+        return attrs
+
+    def apply_url_policy(self, attrs):
+        """Runs the href in an attrs dict through the url policy
+
+        :arg dict attrs: map of ``(namespace, name)`` -> ``value``
+
+        :returns: adjusted attrs dict or ``None`` if the policy rejected the
+            href and the link should be dropped
+
+        """
+        if self.url_policy is None or (None, "href") not in attrs:
+            return attrs
+
+        result = self.url_policy(
+            "a", None, "href", attrs[(None, "href")], self.base_url
+        )
+        if result is None:
+            return None
+
+        # The policy can return a URLPolicyResult or a plain value; duck-type
+        # here so this module doesn't depend on bleach.url_policy
+        adopted = getattr(result, "value", result)
+        if adopted is None:
+            return None
+
+        attrs[(None, "href")] = adopted
         return attrs
 
     def extract_character_data(self, token_list):
@@ -312,6 +363,8 @@ class LinkifyFilter(html5lib_shim.Filter):
                         "_text": match.group(0),
                     }
                     attrs = self.apply_callbacks(attrs, True)
+                    if attrs is not None:
+                        attrs = self.apply_url_policy(attrs)
 
                     if attrs is None:
                         # Just add the text--but not as a link
@@ -430,6 +483,8 @@ class LinkifyFilter(html5lib_shim.Filter):
 
                     attrs = {(None, "href"): href, "_text": url}
                     attrs = self.apply_callbacks(attrs, True)
+                    if attrs is not None:
+                        attrs = self.apply_url_policy(attrs)
 
                     if attrs is None:
                         # Just add the text

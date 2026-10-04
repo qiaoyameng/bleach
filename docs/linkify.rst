@@ -308,6 +308,28 @@ writing callbacks that may need to behave differently if the protocol is
 ``mailto:``.
 
 
+Applying a URL policy to generated links (``url_policy``)
+=========================================================
+
+Links that linkify generates can go through the same URL policy entry point
+as :py:class:`bleach.sanitizer.Cleaner`. Pass ``url_policy`` and a fixed
+``base_url``; the policy runs after callbacks and decides whether the
+generated ``href`` is adopted, rewritten, or rejected (in which case the
+text is left unlinked):
+
+.. doctest::
+
+   >>> from bleach.linkifier import Linker
+   >>> from bleach.url_policy import OriginURLPolicy
+
+   >>> policy = OriginURLPolicy(
+   ...     resource_origins={'link': ['https://example.com']},
+   ... )
+   >>> linker = Linker(url_policy=policy, base_url='https://example.com/')
+   >>> linker.linkify('see https://example.com/x or https://evil.example.net/y')
+   'see <a href="https://example.com/x" rel="nofollow">https://example.com/x</a> or https://evil.example.net/y'
+
+
 Using ``bleach.linkifier.Linker``
 =================================
 

@@ -27,6 +27,8 @@ def clean(
     strip=False,
     strip_comments=True,
     css_sanitizer=None,
+    url_policy=None,
+    base_url="",
 ):
     """Clean an HTML fragment of malicious content and return it
 
@@ -68,6 +70,11 @@ def clean(
     :arg CSSSanitizer css_sanitizer: instance with a "sanitize_css" method for
         sanitizing style attribute values and style text; defaults to None
 
+    :arg url_policy: callable deciding whether a URI attribute value is
+        allowed and what value to adopt; see :py:class:`bleach.sanitizer.Cleaner`
+
+    :arg str base_url: fixed base URL passed to the url policy
+
     :returns: cleaned text as unicode
 
     """
@@ -78,11 +85,20 @@ def clean(
         strip=strip,
         strip_comments=strip_comments,
         css_sanitizer=css_sanitizer,
+        url_policy=url_policy,
+        base_url=base_url,
     )
     return cleaner.clean(text)
 
 
-def linkify(text, callbacks=DEFAULT_CALLBACKS, skip_tags=None, parse_email=False):
+def linkify(
+    text,
+    callbacks=DEFAULT_CALLBACKS,
+    skip_tags=None,
+    parse_email=False,
+    url_policy=None,
+    base_url="",
+):
     """Convert URL-like strings in an HTML fragment to links
 
     This function converts strings that look like URLs, domain names and email
@@ -118,8 +134,19 @@ def linkify(text, callbacks=DEFAULT_CALLBACKS, skip_tags=None, parse_email=False
 
     :arg bool parse_email: whether or not to linkify email addresses
 
+    :arg url_policy: callable deciding whether the href of a generated link is
+        allowed and what value to adopt; see :py:class:`bleach.linkifier.Linker`
+
+    :arg str base_url: fixed base URL passed to the url policy
+
     :returns: linkified text as unicode
 
     """
-    linker = Linker(callbacks=callbacks, skip_tags=skip_tags, parse_email=parse_email)
+    linker = Linker(
+        callbacks=callbacks,
+        skip_tags=skip_tags,
+        parse_email=parse_email,
+        url_policy=url_policy,
+        base_url=base_url,
+    )
     return linker.linkify(text)

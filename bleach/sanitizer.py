@@ -50,6 +50,89 @@ INVISIBLE_CHARACTERS_RE = re.compile("[" + INVISIBLE_CHARACTERS + "]", re.UNICOD
 INVISIBLE_REPLACEMENT_CHAR = "?"
 
 
+def normalize_uri_value(value):
+    """Normalizes a uri value for scheme and origin checks
+
+    This converts HTML entities and strips backtick, whitespace and control
+    characters. It's the same normalization the protocol check in
+    :func:`sanitize_uri_value` performs, pulled out so URL policy
+    implementations can normalize values identically.
+
+    .. Note::
+
+       This transforms the value into a normalized one that's easier to match
+       and verify, but shouldn't get returned since it's vastly different than
+       the original value.
+
+    :arg value: the uri value to normalize
+
+    :returns: normalized value
+
+    """
+    # Convert all character entities in the value
+    normalized_uri = html5lib_shim.convert_entities(value)
+
+    # Strip backtick, whitespace, and control characters
+    normalized_uri = re.sub(r"[`\000-\040\177-\240\s]+", "", normalized_uri)
+
+    return normalized_uri
+
+
+def sanitize_uri_value(value, allowed_protocols):
+    """Checks a uri value to see if it's allowed
+
+    :arg value: the uri value to sanitize
+    :arg allowed_protocols: set of allowed protocols
+
+    :returns: allowed value or None
+
+    """
+    # NOTE(willkg): This transforms the value into a normalized one that's
+    # easier to match and verify, but shouldn't get returned since it's
+    # vastly different than the original value.
+
+    # Convert all character entities and strip backtick, whitespace, and
+    # control characters
+    normalized_uri = normalize_uri_value(value)
+
+    # Strip non-ASCII characters so that urlparse can parse the url into
+    # components correctly. This drops invisible and whitespace unicode
+    # characters among other things.
+    normalized_uri = re.sub(r"[^\x00-\x7f]", "", normalized_uri)
+
+    # Lowercase value to make matching easier
+    normalized_uri = normalized_uri.lower()
+
+    try:
+        # Drop attributes with uri values that have protocols that aren't
+        # allowed
+        parsed = parse_shim.urlparse(normalized_uri)
+    except ValueError:
+        # URI is impossible to parse, therefore it's not allowed
+        return None
+
+    if parsed.scheme:
+        # If urlparse found a scheme, check that
+        if parsed.scheme in allowed_protocols:
+            return value
+
+    else:
+        # Allow uris that are just an anchor
+        if normalized_uri.startswith("#"):
+            return value
+
+        # Handle protocols that urlparse doesn't recognize like "myprotocol"
+        if ":" in normalized_uri and normalized_uri.split(":")[0] in allowed_protocols:
+            return value
+
+        # If there's no protocol/scheme specified, then assume it's "http" or
+        # "https" and see if that's allowed
+        if "http" in allowed_protocols or "https" in allowed_protocols:
+            return value
+
+    return None
+
+
 class NoCssSanitizerWarning(UserWarning):
     pass
 
@@ -92,6 +175,8 @@ class Cleaner:
         strip_comments=True,
         filters=None,
         css_sanitizer=None,
+        url_policy=None,
+        base_url="",
     ):
         """Initializes a Cleaner
 
@@ -120,6 +205,23 @@ class Cleaner:
         :arg CSSSanitizer css_sanitizer: instance with a "sanitize_css" method for
             sanitizing style attribute values and style text; defaults to None
 
+        :arg url_policy: callable deciding whether a URI attribute value is
+            allowed and what value to adopt; called as
+            ``url_policy(tag, namespace, attribute, value, base_url)`` for every
+            attribute that holds a URI and returns either a
+            ``bleach.url_policy.URLPolicyResult``, the adopted value as a str,
+            or ``None`` to drop the attribute; defaults to None meaning the
+            built-in protocol check is used
+
+            .. Note::
+
+               SVG local fragment constraints (``svg_allow_local_href`` and
+               friends) are applied independently of the url policy and are
+               not loosened by it.
+
+        :arg str base_url: fixed base URL that relative and protocol-relative
+            values are resolved against when the url policy runs; defaults to ""
+
         """
         self.tags = tags
         self.attributes = attributes
@@ -128,6 +230,8 @@ class Cleaner:
         self.strip_comments = strip_comments
         self.filters = filters or []
         self.css_sanitizer = css_sanitizer
+        self.url_policy = url_policy
+        self.base_url = base_url
 
         self.parser = html5lib_shim.BleachHTMLParser(
             tags=self.tags,
@@ -197,6 +301,8 @@ class Cleaner:
             strip_html_comments=self.strip_comments,
             css_sanitizer=self.css_sanitizer,
             allowed_protocols=self.protocols,
+            url_policy=self.url_policy,
+            base_url=self.base_url,
         )
 
         # Apply any filters after the BleachSanitizerFilter
@@ -268,6 +374,8 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
         strip_disallowed_tags=False,
         strip_html_comments=True,
         css_sanitizer=None,
+        url_policy=None,
+        base_url="",
     ):
         """Creates a BleachSanitizerFilter instance
 
@@ -298,6 +406,11 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
         :arg CSSSanitizer css_sanitizer: instance with a "sanitize_css" method for
             sanitizing style attribute values and style text; defaults to None
 
+        :arg url_policy: callable deciding whether a URI attribute value is
+            allowed and what value to adopt; see :py:class:`Cleaner`
+
+        :arg str base_url: fixed base URL passed to the url policy
+
         """
         # NOTE(willkg): This is the superclass of
         # html5lib.filters.sanitizer.Filter. We call this directly skipping the
@@ -317,6 +430,8 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
         self.svg_attr_val_allows_ref = svg_attr_val_allows_ref
         self.css_sanitizer = css_sanitizer
         self.svg_allow_local_href = svg_allow_local_href
+        self.url_policy = url_policy
+        self.base_url = base_url
 
     def sanitize_stream(self, token_iterator):
         for token in token_iterator:
@@ -481,55 +596,30 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
         :returns: allowed value or None
 
         """
-        # NOTE(willkg): This transforms the value into a normalized one that's
-        # easier to match and verify, but shouldn't get returned since it's
-        # vastly different than the original value.
+        return sanitize_uri_value(value, allowed_protocols)
 
-        # Convert all character entities in the value
-        normalized_uri = html5lib_shim.convert_entities(value)
+    def apply_url_policy(self, tag, namespace, attribute, value):
+        """Runs a uri value through the url policy
 
-        # Strip backtick, whitespace, and control characters
-        normalized_uri = re.sub(r"[`\000-\040\177-\240\s]+", "", normalized_uri)
+        :arg tag: the tag name the attribute is on
+        :arg namespace: the attribute namespace or None
+        :arg attribute: the attribute name
+        :arg value: the original attribute value
 
-        # Strip non-ASCII characters so that urlparse can parse the url into
-        # components correctly. This drops invisible and whitespace unicode
-        # characters among other things.
-        normalized_uri = re.sub(r"[^\x00-\x7f]", "", normalized_uri)
+        :returns: the adopted value or None if the policy rejected the value
 
-        # Lowercase value to make matching easier
-        normalized_uri = normalized_uri.lower()
-
-        try:
-            # Drop attributes with uri values that have protocols that aren't
-            # allowed
-            parsed = parse_shim.urlparse(normalized_uri)
-        except ValueError:
-            # URI is impossible to parse, therefore it's not allowed
+        """
+        result = self.url_policy(tag, namespace, attribute, value, self.base_url)
+        if result is None:
             return None
 
-        if parsed.scheme:
-            # If urlparse found a scheme, check that
-            if parsed.scheme in allowed_protocols:
-                return value
+        # The policy can return a URLPolicyResult or a plain value; duck-type
+        # here so this module doesn't depend on bleach.url_policy
+        adopted = getattr(result, "value", result)
+        if adopted is None:
+            return None
 
-        else:
-            # Allow uris that are just an anchor
-            if normalized_uri.startswith("#"):
-                return value
-
-            # Handle protocols that urlparse doesn't recognize like "myprotocol"
-            if (
-                ":" in normalized_uri
-                and normalized_uri.split(":")[0] in allowed_protocols
-            ):
-                return value
-
-            # If there's no protocol/scheme specified, then assume it's "http" or
-            # "https" and see if that's allowed
-            if "http" in allowed_protocols or "https" in allowed_protocols:
-                return value
-
-        return None
+        return adopted
 
     def allow_token(self, token):
         """Handles the case where we're allowing the tag"""
@@ -554,7 +644,14 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
                 # Drop attributes with uri values that use a disallowed protocol
                 # Sanitize attributes with uri values
                 if namespaced_name in self.attr_val_is_uri:
-                    new_value = self.sanitize_uri_value(val, self.allowed_protocols)
+                    if self.url_policy is not None:
+                        new_value = self.apply_url_policy(
+                            token["name"], namespace, name, val
+                        )
+                    else:
+                        new_value = self.sanitize_uri_value(
+                            val, self.allowed_protocols
+                        )
                     if new_value is None:
                         continue
                     val = new_value

@@ -240,6 +240,61 @@ Default protocols are in ``bleach.sanitizer.ALLOWED_PROTOCOLS``.
 .. autodata:: bleach.sanitizer.ALLOWED_PROTOCOLS
 
 
+URL policies (``url_policy``)
+=============================
+
+For finer control over URI attribute values, you can pass a URL policy. The
+policy is called for every attribute that holds a URI as
+``url_policy(tag, namespace, attribute, value, base_url)`` and returns either
+a ``bleach.url_policy.URLPolicyResult``, the value to adopt as a str, or
+``None`` to drop the attribute.
+
+``bleach.url_policy.OriginURLPolicy`` lets you configure allowed origins per
+resource category--for example, links may point at external sites, but images
+only load from this site and an image CDN:
+
+.. doctest::
+
+   >>> from bleach.sanitizer import Cleaner
+   >>> from bleach.url_policy import OriginURLPolicy
+
+   >>> policy = OriginURLPolicy(
+   ...     resource_origins={
+   ...         'image': ['https://example.com', 'https://cdn.example.com'],
+   ...     },
+   ... )
+   >>> cleaner = Cleaner(
+   ...     tags={'a', 'img'},
+   ...     attributes={'a': ['href'], 'img': ['src']},
+   ...     url_policy=policy,
+   ...     base_url='https://example.com/',
+   ... )
+
+   >>> cleaner.clean('<a href="https://elsewhere.example.net/x">x</a>')
+   '<a href="https://elsewhere.example.net/x">x</a>'
+
+   >>> cleaner.clean('<img src="https://elsewhere.example.net/x.png">')
+   '<img>'
+
+   >>> cleaner.clean('<img src="/x.png">')
+   '<img src="/x.png">'
+
+Relative paths and protocol-relative urls are resolved against the fixed
+``base_url``; default ports, IDNA host names and username parts of the
+authority are handled when comparing origins. Entity and control character
+normalization matches the protocol check. No network requests are made and no
+DNS resolution is performed.
+
+``OriginURLPolicy`` also supports rewriting values--for example to a
+CDN--via its ``rewrite`` callable. Rewritten values must pass the protocol
+and origin checks again before they're adopted.
+
+SVG local fragment constraints (``svg_allow_local_href`` and friends) are
+applied independently and are not loosened by the URL policy.
+
+.. autoclass:: bleach.url_policy.OriginURLPolicy
+
+
 Stripping markup (``strip``)
 ============================
 
