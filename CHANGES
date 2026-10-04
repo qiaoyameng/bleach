@@ -1,6 +1,31 @@
 Bleach changes
 ==============
 
+Version 6.4.0 (unreleased changes)
+---------------------------------
+
+**Features**
+
+* Added a post-clean node constraint phase (``constraints`` argument on
+  :class:`bleach.sanitizer.Cleaner` and :func:`bleach.clean`).
+
+  Constraint rules are application-provided callables
+  ``(attrs, context)`` that run after the sanitizer and any ``filters``
+  (including ``LinkifyFilter``) over the HTML5-repaired tree. They may delete
+  attributes, restrict token lists, alter type-validated values, or return
+  :data:`bleach.constraints.DROP_NODE` /
+  :data:`bleach.constraints.UNWRAP_NODE`. Rules run in declaration order, see
+  filtered attributes plus a read-only ancestor context, and preserve
+  namespaces. Any value added or replaced by a rule is re-validated against
+  the attribute allow-list, URI protocols and the CSS sanitizer, so rules
+  cannot bypass the configured policy. Repeated cleaning is idempotent for
+  well-behaved rules.
+
+  No business rules are enabled by default. See "Node constraints" in
+  ``docs/clean.rst`` for a sample configuration covering ``target="_blank"``
+  ``rel`` tokens, table-cell ``rowspan``/``colspan`` ranges and ``img``
+  ``alt`` requirements.
+
 Version 6.4.0 (June 5th, 2026)
 ------------------------------
 

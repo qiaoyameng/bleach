@@ -405,6 +405,180 @@ Trivial Filter example:
 .. versionadded:: 2.0
 
 
+Node constraints (``constraints``)
+==================================
+
+The per-attribute allow-list and attribute callbacks work on one attribute at
+a time, so rules that combine several values are awkward:
+
+* a ``target="_blank"`` link that *must* carry specific ``rel`` tokens,
+* a table cell whose ``rowspan``/``colspan`` must be an int in a range,
+* an ``img`` kept only when ``alt`` is present and non-empty.
+
+The ``constraints`` argument adds a second, tree-aware phase that runs
+**after** the sanitizer and any ``filters`` (including
+``LinkifyFilter``). Each constraint is a plain callable::
+
+    def rule(attrs, context): ...
+
+* ``attrs`` is the mapping of attributes that already survived the
+  allow-list, URI protocol, SVG IRI and CSS checks, keyed by
+  ``(namespace, name)``. The rule may delete attributes, trim token lists or
+  replace values that already passed type validation.
+* ``context`` is a read-only :class:`bleach.constraints.NodeContext`: the
+  element's ``name``, its ``namespace``, its token type and an
+  ``ancestors`` tuple of ``(namespace, name)`` pairs taken from the
+  **HTML5-repaired** tree (so mis-nested tags look like what a browser would
+  build).
+
+The rule returns:
+
+* ``None`` (or it just mutates ``attrs`` in place) to keep the node,
+* a replacement ``attrs`` dict,
+* :data:`bleach.constraints.DROP_NODE` to remove the element and everything
+  inside it, or
+* :data:`bleach.constraints.UNWRAP_NODE` to remove just the start/end tags
+  while keeping the children.
+
+Rules run in **declaration order**; once a rule drops or unwraps a node,
+later rules do not see it.
+
+.. Warning::
+
+   Any value a rule *adds* or replaces is run back through the same security
+   checks. A rule cannot introduce a disallowed attribute, a ``javascript:``
+   URL, or CSS that the configured ``css_sanitizer`` would remove. Rules can
+   only operate inside the policy you configure on the ``Cleaner``.
+
+Small helpers are provided in :mod:`bleach.constraints`:
+:func:`~bleach.constraints.get_attr`,
+:func:`~bleach.constraints.set_attr`,
+:func:`~bleach.constraints.del_attr`,
+:func:`~bleach.constraints.get_tokens`,
+:func:`~bleach.constraints.set_tokens`,
+:func:`~bleach.constraints.constrain_tokens` and
+:func:`~bleach.constraints.ensure_rel_tokens`.
+
+These rules are **not** global defaults--you declare and order them per
+``Cleaner``. Here is a configuration for the three rules above:
+
+.. testsetup:: constraints
+
+   from bleach.sanitizer import Cleaner
+   from bleach.constraints import (
+       DROP_NODE,
+       del_attr,
+       ensure_rel_tokens,
+       get_attr,
+       set_attr,
+   )
+
+   def require_rel_for_target_blank(required=("noopener", "noreferrer")):
+       def rule(attrs, context):
+           if context.name == "a" and get_attr(attrs, "target", default="") == "_blank":
+               ensure_rel_tokens(attrs, required)
+       return rule
+
+   def clamp_table_span(name, minimum=1, maximum=65534):
+       def rule(attrs, context):
+           if context.name not in ("td", "th") or (None, name) not in attrs:
+               return
+           raw = get_attr(attrs, name)
+           try:
+               value = int(raw, 10)
+           except (TypeError, ValueError):
+               del_attr(attrs, name)
+               return
+           if value < minimum:
+               del_attr(attrs, name)
+           elif value > maximum:
+               set_attr(attrs, name, str(maximum))
+       return rule
+
+   def drop_images_without_alt(attrs, context):
+       if context.name == "img" and not get_attr(attrs, "alt", default="").strip():
+           return DROP_NODE
+
+   cleaner = Cleaner(
+       tags={"a", "img", "table", "tbody", "tr", "td", "th"},
+       attributes={
+           "a": ["href", "target", "rel"],
+           "img": ["src", "alt"],
+           "td": ["rowspan", "colspan"],
+           "th": ["rowspan", "colspan"],
+       },
+       constraints=[
+           require_rel_for_target_blank(),
+           clamp_table_span("colspan"),
+           clamp_table_span("rowspan"),
+           drop_images_without_alt,
+       ],
+   )
+
+.. doctest:: constraints
+
+   >>> cleaner.clean('<a href="https://example.com" target="_blank">x</a>')
+   '<a href="https://example.com" target="_blank" rel="noopener noreferrer">x</a>'
+   >>> cleaner.clean('<a href="https://example.com" target="_self">x</a>')
+   '<a href="https://example.com" target="_self">x</a>'
+   >>> cleaner.clean('<img src="p.jpg" alt="puppy">')
+   '<img src="p.jpg" alt="puppy">'
+   >>> cleaner.clean('x <img src="p.jpg"> y')
+   'x  y'
+   >>> cleaner.clean('<table><tbody><tr><td colspan="99999">x</td></tr></tbody></table>')
+   '<table><tbody><tr><td colspan="65534">x</td></tr></tbody></table>'
+   >>> cleaner.clean('<table><tbody><tr><td colspan="0">x</td></tr></tbody></table>')
+   '<table><tbody><tr><td>x</td></tr></tbody></table>'
+
+Boundary cases worth knowing about:
+
+* Token rules are case-insensitive but preserve casing; running the rule on
+  output that already contains the tokens must not duplicate or change
+  anything (idempotence).
+* Non-integer and out-of-range span values are removed by the example rule;
+  values above the maximum are clamped instead.
+* ``alt=""`` and whitespace-only ``alt`` are treated as empty.
+* An ``UNWRAP_NODE`` on an empty element (``img``) has nothing to keep, so the
+  element is dropped.
+* Added values are re-validated: a rule that sets ``href`` to
+  ``"javascript:alert(1)"`` causes the attribute to be removed, and a rule
+  that sets ``style`` still goes through the ``CSSSanitizer``.
+* Namespaces are preserved; ``context.namespace`` is the SVG/MathML namespace
+  for foreign content, and namespaced attributes keep their
+  ``(namespace, name)`` keys.
+
+Because constraints run after ``filters``, links created or edited by
+``LinkifyFilter`` are subject to the same final constraints:
+
+.. code-block:: python
+
+   import functools
+   from bleach.linkifier import LinkifyFilter
+
+   def open_in_new_tab(attrs, new=False):
+       if (None, "href") in attrs:
+           attrs[(None, "target")] = "_blank"
+       return attrs
+
+   cleaner = Cleaner(
+       tags={"a"},
+       attributes={"a": ["href", "target", "rel"]},
+       filters=[functools.partial(LinkifyFilter, callbacks=[open_in_new_tab])],
+       constraints=[require_rel_for_target_blank()],
+   )
+   cleaner.clean("see https://example.com")
+   # 'see <a href="https://example.com" target="_blank"
+   #  rel="noopener noreferrer">https://example.com</a>'
+
+.. versionadded:: 6.4
+
+.. autoclass:: bleach.constraints.NodeContext
+   :members:
+
+.. autoclass:: bleach.constraints.NodeConstraintFilter
+   :members:
+
+
 Using ``bleach.sanitizer.BleachSanitizerFilter``
 ================================================
 

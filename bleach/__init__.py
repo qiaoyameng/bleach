@@ -1,3 +1,9 @@
+from bleach.constraints import (
+    DROP_NODE,
+    UNWRAP_NODE,
+    NodeConstraintFilter,
+    NodeContext,
+)
 from bleach.linkifier import (
     DEFAULT_CALLBACKS,
     Linker,
@@ -9,14 +15,20 @@ from bleach.sanitizer import (
     Cleaner,
 )
 
-
 # yyyymmdd
 __releasedate__ = "20260605"
 # x.y.z or x.y.z.dev0 -- semver
 __version__ = "6.4.0"
 
 
-__all__ = ["clean", "linkify"]
+__all__ = [
+    "DROP_NODE",
+    "UNWRAP_NODE",
+    "NodeConstraintFilter",
+    "NodeContext",
+    "clean",
+    "linkify",
+]
 
 
 def clean(
@@ -27,6 +39,7 @@ def clean(
     strip=False,
     strip_comments=True,
     css_sanitizer=None,
+    constraints=None,
 ):
     """Clean an HTML fragment of malicious content and return it
 
@@ -68,6 +81,9 @@ def clean(
     :arg CSSSanitizer css_sanitizer: instance with a "sanitize_css" method for
         sanitizing style attribute values and style text; defaults to None
 
+    :arg list constraints: ordered list of post-clean node constraint rules
+        (see :class:`bleach.sanitizer.Cleaner`); defaults to None
+
     :returns: cleaned text as unicode
 
     """
@@ -78,6 +94,7 @@ def clean(
         strip=strip,
         strip_comments=strip_comments,
         css_sanitizer=css_sanitizer,
+        constraints=constraints,
     )
     return cleaner.clean(text)
 

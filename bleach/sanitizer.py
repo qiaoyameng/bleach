@@ -92,6 +92,7 @@ class Cleaner:
         strip_comments=True,
         filters=None,
         css_sanitizer=None,
+        constraints=None,
     ):
         """Initializes a Cleaner
 
@@ -120,6 +121,15 @@ class Cleaner:
         :arg CSSSanitizer css_sanitizer: instance with a "sanitize_css" method for
             sanitizing style attribute values and style text; defaults to None
 
+        :arg list constraints: ordered list of post-clean node constraint
+            rules; each is a callable ``(attrs, context)`` that may modify
+            filtered attributes, return
+            :data:`bleach.constraints.DROP_NODE` or
+            :data:`bleach.constraints.UNWRAP_NODE`. Rules run after the
+            sanitizer and all ``filters`` (including ``LinkifyFilter``), and
+            any value they add is re-checked against the attribute, protocol
+            and CSS policy. Defaults to ``None`` (no constraint rules).
+
         """
         self.tags = tags
         self.attributes = attributes
@@ -128,6 +138,7 @@ class Cleaner:
         self.strip_comments = strip_comments
         self.filters = filters or []
         self.css_sanitizer = css_sanitizer
+        self.constraints = constraints or []
 
         self.parser = html5lib_shim.BleachHTMLParser(
             tags=self.tags,
@@ -203,6 +214,19 @@ class Cleaner:
         for filter_class in self.filters:
             filtered = filter_class(source=filtered)
 
+        # Node constraints run last so they see the repaired tree after all
+        # filtering--including links created or adjusted by LinkifyFilter.
+        if self.constraints:
+            from bleach.constraints import NodeConstraintFilter
+
+            filtered = NodeConstraintFilter(
+                source=filtered,
+                rules=self.constraints,
+                attributes=self.attributes,
+                allowed_protocols=self.protocols,
+                css_sanitizer=self.css_sanitizer,
+            )
+
         return self.serializer.render(filtered)
 
 
@@ -247,6 +271,155 @@ def attribute_filter_factory(attributes):
         return _attr_filter
 
     raise ValueError("attributes needs to be a callable, a list or a dict")
+
+
+def sanitize_uri_value(value, allowed_protocols):
+    """Checks a uri value to see if it is allowed
+
+    :arg value: the uri value to sanitize
+    :arg allowed_protocols: set of allowed protocols
+
+    :returns: the original value when allowed, otherwise ``None``
+
+    """
+    # NOTE(willkg): This transforms the value into a normalized one that's
+    # easier to match and verify, but shouldn't get returned since it's
+    # vastly different than the original value.
+
+    # Convert all character entities in the value
+    normalized_uri = html5lib_shim.convert_entities(value)
+
+    # Strip backtick, whitespace, and control characters
+    normalized_uri = re.sub(r"[`\000-\040\177-\240\s]+", "", normalized_uri)
+
+    # Strip non-ASCII characters so that urlparse can parse the url into
+    # components correctly. This drops invisible and whitespace unicode
+    # characters among other things.
+    normalized_uri = re.sub(r"[^\x00-\x7f]", "", normalized_uri)
+
+    # Lowercase value to make matching easier
+    normalized_uri = normalized_uri.lower()
+
+    try:
+        # Drop attributes with uri values that have protocols that aren't
+        # allowed
+        parsed = parse_shim.urlparse(normalized_uri)
+    except ValueError:
+        # URI is impossible to parse, therefore it's not allowed
+        return None
+
+    if parsed.scheme:
+        # If urlparse found a scheme, check that
+        if parsed.scheme in allowed_protocols:
+            return value
+
+    else:
+        # Allow uris that are just an anchor
+        if normalized_uri.startswith("#"):
+            return value
+
+        # Handle protocols that urlparse doesn't recognize like "myprotocol"
+        if ":" in normalized_uri and normalized_uri.split(":")[0] in allowed_protocols:
+            return value
+
+        # If there's no protocol/scheme specified, then assume it's "http" or
+        # "https" and see if that's allowed
+        if "http" in allowed_protocols or "https" in allowed_protocols:
+            return value
+
+    return None
+
+
+def sanitize_attributes(
+    token_name,
+    attrs,
+    attr_filter,
+    allowed_protocols,
+    attr_val_is_uri,
+    svg_attr_val_allows_ref,
+    svg_allow_local_href,
+    css_sanitizer,
+    sanitize_uri_value,
+):
+    """Runs the security checks over a token's attribute mapping.
+
+    This drops attributes that are not allowed, are unsafe or break other
+    rules, and fixes attribute values that need fixing. It is used both by
+    the initial sanitizing pass and by the post-clean node constraint phase,
+    so that values added by constraint rules cannot bypass the configured
+    attribute, protocol or CSS policy.
+
+    :arg str token_name: name of the element the attributes belong to
+    :arg dict attrs: ``(namespace, name) -> value`` mapping
+    :arg attr_filter: callable produced by
+        :func:`attribute_filter_factory`
+    :arg set allowed_protocols: set of allowed URI protocols
+    :arg attr_val_is_uri: set of ``(namespace, name)`` URI attributes
+    :arg svg_attr_val_allows_ref: set of SVG attributes allowing IRI refs
+    :arg svg_allow_local_href: set of SVG elements allowed local hrefs
+    :arg css_sanitizer: CSSSanitizer instance or None
+    :arg sanitize_uri_value: callable ``(value) -> value or None`` used to
+        validate URI attribute values
+    :returns: a new mapping of the attributes to keep
+
+    """
+    kept = {}
+    for namespaced_name, val in attrs.items():
+        namespace, name = namespaced_name
+
+        # Drop attributes that are not explicitly allowed
+        #
+        # NOTE(willkg): We pass in the attribute name--not a namespaced
+        # name.
+        if not attr_filter(token_name, name, val):
+            continue
+
+        # Drop attributes with uri values that use a disallowed protocol
+        # Sanitize attributes with uri values
+        if namespaced_name in attr_val_is_uri:
+            new_value = sanitize_uri_value(val)
+            if new_value is None:
+                continue
+            val = new_value
+
+        # Drop values in svg attrs with non-local IRIs
+        if namespaced_name in svg_attr_val_allows_ref:
+            new_val = re.sub(r"url\s*\(\s*[^#\s][^)]+?\)", " ", unescape(val))
+            new_val = new_val.strip()
+            if not new_val:
+                continue
+
+            else:
+                # Replace the val with the unescaped version because it's
+                # a iri
+                val = new_val
+
+        # Drop href and xlink:href attr for svg elements with non-local IRIs
+        if (None, token_name) in svg_allow_local_href:
+            if namespaced_name in [
+                (None, "href"),
+                (html5lib_shim.namespaces["xlink"], "href"),
+            ]:
+                if re.search(r"^\s*[^#\s]", val):
+                    continue
+
+        # If it's a style attribute, sanitize it
+        if namespaced_name == (None, "style"):
+            if css_sanitizer:
+                val = css_sanitizer.sanitize_css(val)
+            else:
+                # FIXME(willkg): if style is allowed, but no css_sanitizer
+                # was set up, then this is probably a mistake and we should
+                # raise an error here.
+                #
+                # For now, we're going to set the value to "" because there
+                # was no sanitizer set
+                val = ""
+
+        # At this point, we want to keep the attribute, so add it in
+        kept[namespaced_name] = val
+
+    return kept
 
 
 class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
@@ -475,128 +648,28 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
     def sanitize_uri_value(self, value, allowed_protocols):
         """Checks a uri value to see if it's allowed
 
-        :arg value: the uri value to sanitize
-        :arg allowed_protocols: set of allowed protocols
-
-        :returns: allowed value or None
+        Thin wrapper around the module-level
+        :func:`sanitize_uri_value`.
 
         """
-        # NOTE(willkg): This transforms the value into a normalized one that's
-        # easier to match and verify, but shouldn't get returned since it's
-        # vastly different than the original value.
-
-        # Convert all character entities in the value
-        normalized_uri = html5lib_shim.convert_entities(value)
-
-        # Strip backtick, whitespace, and control characters
-        normalized_uri = re.sub(r"[`\000-\040\177-\240\s]+", "", normalized_uri)
-
-        # Strip non-ASCII characters so that urlparse can parse the url into
-        # components correctly. This drops invisible and whitespace unicode
-        # characters among other things.
-        normalized_uri = re.sub(r"[^\x00-\x7f]", "", normalized_uri)
-
-        # Lowercase value to make matching easier
-        normalized_uri = normalized_uri.lower()
-
-        try:
-            # Drop attributes with uri values that have protocols that aren't
-            # allowed
-            parsed = parse_shim.urlparse(normalized_uri)
-        except ValueError:
-            # URI is impossible to parse, therefore it's not allowed
-            return None
-
-        if parsed.scheme:
-            # If urlparse found a scheme, check that
-            if parsed.scheme in allowed_protocols:
-                return value
-
-        else:
-            # Allow uris that are just an anchor
-            if normalized_uri.startswith("#"):
-                return value
-
-            # Handle protocols that urlparse doesn't recognize like "myprotocol"
-            if (
-                ":" in normalized_uri
-                and normalized_uri.split(":")[0] in allowed_protocols
-            ):
-                return value
-
-            # If there's no protocol/scheme specified, then assume it's "http" or
-            # "https" and see if that's allowed
-            if "http" in allowed_protocols or "https" in allowed_protocols:
-                return value
-
-        return None
+        return sanitize_uri_value(value, allowed_protocols=allowed_protocols)
 
     def allow_token(self, token):
         """Handles the case where we're allowing the tag"""
         if "data" in token:
-            # Loop through all the attributes and drop the ones that are not
-            # allowed, are unsafe or break other rules. Additionally, fix
-            # attribute values that need fixing.
-            #
-            # At the end of this loop, we have the final set of attributes
-            # we're keeping.
-            attrs = {}
-            for namespaced_name, val in token["data"].items():
-                namespace, name = namespaced_name
-
-                # Drop attributes that are not explicitly allowed
-                #
-                # NOTE(willkg): We pass in the attribute name--not a namespaced
-                # name.
-                if not self.attr_filter(token["name"], name, val):
-                    continue
-
-                # Drop attributes with uri values that use a disallowed protocol
-                # Sanitize attributes with uri values
-                if namespaced_name in self.attr_val_is_uri:
-                    new_value = self.sanitize_uri_value(val, self.allowed_protocols)
-                    if new_value is None:
-                        continue
-                    val = new_value
-
-                # Drop values in svg attrs with non-local IRIs
-                if namespaced_name in self.svg_attr_val_allows_ref:
-                    new_val = re.sub(r"url\s*\(\s*[^#\s][^)]+?\)", " ", unescape(val))
-                    new_val = new_val.strip()
-                    if not new_val:
-                        continue
-
-                    else:
-                        # Replace the val with the unescaped version because
-                        # it's a iri
-                        val = new_val
-
-                # Drop href and xlink:href attr for svg elements with non-local IRIs
-                if (None, token["name"]) in self.svg_allow_local_href:
-                    if namespaced_name in [
-                        (None, "href"),
-                        (html5lib_shim.namespaces["xlink"], "href"),
-                    ]:
-                        if re.search(r"^\s*[^#\s]", val):
-                            continue
-
-                # If it's a style attribute, sanitize it
-                if namespaced_name == (None, "style"):
-                    if self.css_sanitizer:
-                        val = self.css_sanitizer.sanitize_css(val)
-                    else:
-                        # FIXME(willkg): if style is allowed, but no
-                        # css_sanitizer was set up, then this is probably a
-                        # mistake and we should raise an error here
-                        #
-                        # For now, we're going to set the value to "" because
-                        # there was no sanitizer set
-                        val = ""
-
-                # At this point, we want to keep the attribute, so add it in
-                attrs[namespaced_name] = val
-
-            token["data"] = attrs
+            token["data"] = sanitize_attributes(
+                token_name=token["name"],
+                attrs=token["data"],
+                attr_filter=self.attr_filter,
+                allowed_protocols=self.allowed_protocols,
+                attr_val_is_uri=self.attr_val_is_uri,
+                svg_attr_val_allows_ref=self.svg_attr_val_allows_ref,
+                svg_allow_local_href=self.svg_allow_local_href,
+                css_sanitizer=self.css_sanitizer,
+                sanitize_uri_value=lambda value: self.sanitize_uri_value(
+                    value, self.allowed_protocols
+                ),
+            )
 
         return token
 
